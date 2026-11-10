@@ -36,6 +36,7 @@ import { MailSplitTabs } from "@/app/(app)/[emailAccountId]/mail/MailSplitTabs";
 import { SelectAllCheckbox } from "@/app/(app)/[emailAccountId]/mail/SelectAllCheckbox";
 import { MailListPanel } from "@/app/(app)/[emailAccountId]/mail/MailListPanel";
 import { MailReaderPane } from "@/app/(app)/[emailAccountId]/mail/MailReaderPane";
+import { MailPreviewOverlay } from "@/app/(app)/[emailAccountId]/mail/MailPreviewOverlay";
 import { ScheduledEmailList } from "@/app/(app)/[emailAccountId]/mail/ScheduledEmailList";
 import type { MailboxItem } from "@/app/(app)/[emailAccountId]/mail/MailboxItemContextMenu";
 import { ListSenderCommands } from "@/app/(app)/[emailAccountId]/mail/ListSenderCommands";
@@ -105,7 +106,8 @@ import {
 } from "@/generated/prisma/enums";
 import { MailSetupPanel } from "@/app/(app)/[emailAccountId]/mail/MailSetupPanel";
 import { useSidebar } from "@/components/ui/sidebar";
-import { useAtomValue, useSetAtom } from "jotai";
+import { useAtom, useAtomValue, useSetAtom } from "jotai";
+import { mailPreviewAtom, mailScreenMountedAtom } from "@/store/mail-preview";
 import {
   commandPaletteOpenAtom,
   mailCommandContextAtom,
@@ -185,6 +187,11 @@ export function MailShell() {
   // The side panel viewer owns the triage keys while it's open, so this screen
   // stands down rather than both archiving the same keystroke.
   const { threadId: sidePanelThreadId } = useDisplayedEmail();
+  const [preview, setPreview] = useAtom(mailPreviewAtom);
+  // A preview opened under another account can't load in this one.
+  const previewThreadId =
+    preview?.emailAccountId === emailAccountId ? preview.threadId : null;
+  const setMailScreenMounted = useSetAtom(mailScreenMountedAtom);
   const client = useOptionalMailClient();
 
   const [openThreadQuery, setOpenThreadQuery] = useQueryStates({
@@ -1469,7 +1476,13 @@ export function MailShell() {
     if (target) setActiveSplitId(target.id);
   };
   const handlers: ShortcutHandlers = (() => {
-    if (sidePanelThreadId || labelPicker || splitPickerThreads) return {};
+    if (
+      sidePanelThreadId ||
+      previewThreadId ||
+      labelPicker ||
+      splitPickerThreads
+    )
+      return {};
     return {
       unsubscribe:
         !isMailOverlayOpen && !senderCommands?.isUnsubscribeDisabled
@@ -1771,23 +1784,63 @@ export function MailShell() {
   const appliedAssistantKeys = useRef<ReadonlySet<string>>(new Set());
   const applyMailScreenAction = useStableCallback(
     (action: MailScreenAction) => {
+      // A search or selection lands in the list, which an open email or
+      // preview would otherwise keep covering.
+      const revealList = () => {
+        setPreview(null);
+        if (layout === "list") setOpenThread(null);
+      };
       switch (action.action) {
         case "open_thread":
           setOpenThread({ emailAccountId, threadId: action.threadId });
           return;
         case "search":
+          revealList();
           setSearch(action.query);
           return;
         case "select_threads":
+          revealList();
           // Replaces the selection outright, so an older one can't be left
           // looking like the assistant's pick if no requested row shows up.
           appliedAssistantKeys.current = new Set();
           selection.clear();
           setAssistantSelection(action.threadIds);
           return;
+        case "show_split":
+          // The chat may have finished after the user switched accounts.
+          if (action.emailAccountId !== emailAccountId) return;
+          // Split tabs only show on this account's unscoped, unsearched inbox.
+          revealList();
+          setAssistantSelection(null);
+          appliedAssistantKeys.current = new Set();
+          selection.clear();
+          setSearch("");
+          setScopeType(null);
+          setScopeLabelId(null);
+          setScopeFolderId(null);
+          setAccountScope(null);
+          setActiveSplitId(action.splitId);
+          return;
       }
     },
   );
+  useEffect(() => {
+    setMailScreenMounted(true);
+    return () => {
+      setMailScreenMounted(false);
+      setPreview(null);
+    };
+  }, [setMailScreenMounted, setPreview]);
+  const closePreview = useCallback(() => setPreview(null), [setPreview]);
+  const navigatePreview = useCallback(
+    (threadId: string) => setPreview({ emailAccountId, threadId }),
+    [emailAccountId, setPreview],
+  );
+  const openPreviewInReader = useCallback(() => {
+    if (!previewThreadId) return;
+    setOpenThread({ emailAccountId, threadId: previewThreadId });
+    setPreview(null);
+  }, [emailAccountId, previewThreadId, setOpenThread, setPreview]);
   useEffect(() => {
     setMailScreenActionHandler(applyMailScreenAction);
     return () => setMailScreenActionHandler(null);
@@ -1963,7 +2016,10 @@ export function MailShell() {
         <MailEngineConnectionBanner />
         <div className="relative flex min-h-0 min-w-0 flex-1">
           {showList && (
-            <MailListPanel layout={layout} inert={readerPreparing}>
+            <MailListPanel
+              layout={layout}
+              inert={readerPreparing || Boolean(previewThreadId)}
+            >
               <ListToolbar
                 onOpenMailNav={() => setIsMailNavOpen(true)}
                 layout={layout}
@@ -2122,6 +2178,8 @@ export function MailShell() {
                 "flex min-h-0 min-w-0 flex-1 flex-col",
                 readerPreparing && "invisible absolute inset-0",
               )}
+              // The chat's email preview covers the reader; keep focus out of it.
+              inert={Boolean(previewThreadId)}
             >
               <MailReaderPane
                 readerEmailAccount={readerEmailAccount}
@@ -2151,7 +2209,7 @@ export function MailShell() {
                 onPrint={printOpenThread}
                 isMenuOpen={isMenuOpen}
                 onMenuOpenChange={setIsMenuOpen}
-                enableMessageNavigation={!sidePanelThreadId}
+                enableMessageNavigation={!sidePanelThreadId && !previewThreadId}
                 thread={openThread ?? null}
                 threadId={openThreadId}
                 detailSelectionSettled={readerSelectionSettled}
@@ -2181,6 +2239,15 @@ export function MailShell() {
                 autoOpenForwardForMessageId={forwardToMessageId}
               />
             </div>
+          ) : null}
+
+          {previewThreadId ? (
+            <MailPreviewOverlay
+              threadId={previewThreadId}
+              onClose={closePreview}
+              onNavigate={navigatePreview}
+              onOpenInReader={openPreviewInReader}
+            />
           ) : null}
         </div>
       </div>
