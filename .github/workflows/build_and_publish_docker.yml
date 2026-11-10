@@ -25,7 +25,6 @@ env:
 
 jobs:
   build-docker:
-    if: github.repository == 'elie222/inbox-zero'
     name: "Build Docker Image"
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -41,8 +40,8 @@ jobs:
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: |
-            ghcr.io/${{ env.DOCKER_USERNAME }}/inbox-zero
-            ${{ env.DOCKER_USERNAME }}/inbox-zero
+            ghcr.io/${{ github.repository }}
+            name=${{ env.DOCKER_USERNAME }}/inbox-zero,enable=${{ github.repository_owner == 'elie222' }}
           tags: |
             # Always tag with short SHA
             type=sha,prefix=
@@ -56,19 +55,22 @@ jobs:
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.DOCKER_IMAGE_REGISTRY }}
-          username: ${{ env.DOCKER_USERNAME }}
+          username: ${{ github.repository_owner == 'elie222' && env.DOCKER_USERNAME || github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to Docker Hub
+        if: github.repository_owner == 'elie222'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ env.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set up Depot
+        if: github.repository_owner == 'elie222'
         uses: depot/setup-action@15c09a5f77a0840ad4bce955686522a257853461 # v1
 
       - name: Build and Push Docker Image
+        if: github.repository_owner == 'elie222'
         uses: depot/build-push-action@5f3b3c2e5a00f0093de47f657aeaefcedff27d18 # v1
         with:
           project: ${{ env.DEPOT_PROJECT_ID }}
@@ -79,7 +81,25 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
+      - name: Build and Push Docker Image with Docker
+        if: github.repository_owner != 'elie222'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          LABELS: ${{ steps.meta.outputs.labels }}
+        run: |
+          args=(--file docker/Dockerfile.prod --platform linux/amd64 --push)
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            args+=(--tag "$tag")
+          done <<< "$TAGS"
+          while IFS= read -r label; do
+            [ -n "$label" ] || continue
+            args+=(--label "$label")
+          done <<< "$LABELS"
+          docker buildx build "${args[@]}" .
+
       - name: Update Docker Hub Description
+        if: github.repository_owner == 'elie222'
         uses: peter-evans/dockerhub-description@432a30c9e07499fd01da9f8a49f0faf9e0ca5b77 # v4
         with:
           username: ${{ env.DOCKER_USERNAME }}
