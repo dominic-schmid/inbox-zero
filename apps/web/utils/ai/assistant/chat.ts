@@ -7,6 +7,7 @@ import { getEmailForLLM } from "@/utils/get-email-from-message";
 import type { ParsedMessage } from "@/utils/types";
 import { env } from "@/env";
 import type { EmailAccountWithAI } from "@/utils/llms/types";
+import { createFinalReplyStep } from "@/utils/ai/assistant/final-reply-step";
 import { toolCallAgentStream } from "@/utils/llms";
 import { isConversationStatusType } from "@/utils/reply-tracker/conversation-status-config";
 import prisma from "@/utils/prisma";
@@ -40,6 +41,7 @@ import {
 import { saveMemoryTool, searchMemoriesTool } from "./chat-memory-tools";
 import { getCalendarEventsTool } from "./chat-calendar-tools";
 import { controlMailScreenTool } from "./chat-mail-screen-tool";
+import { manageSplitInboxTool } from "./chat-split-inbox-tool";
 import { hasUsableCalendarConnection } from "@/utils/calendar/event-provider";
 import type { MessagingPlatform } from "@/utils/messaging/platforms";
 import type { SerializedMatchReason } from "@/utils/ai/choose-rule/types";
@@ -57,7 +59,7 @@ import { guardChatTools } from "@/utils/ai/assistant/chat-tool-guards";
 
 export const maxDuration = 800;
 // Increment when chat prompts, tools, or routing change so run quality remains attributable.
-export const ASSISTANT_CHAT_PIPELINE_VERSION = 17;
+export const ASSISTANT_CHAT_PIPELINE_VERSION = 19;
 const ASSISTANT_CHAT_TOOL_BUDGET_MS = {
   web: 720_000,
   messaging: 60_000,
@@ -341,6 +343,7 @@ export async function aiProcessAssistantChat({
     ...providerPolicy.getTaxonomyTools(toolOptions),
     // Settings
     updateAssistantSettings: updateAssistantSettingsTool(toolOptions),
+    manageSplitInbox: manageSplitInboxTool(toolOptions),
     // Memory
     searchMemories: searchMemoriesTool(toolOptions),
     saveMemory: saveMemoryTool({
@@ -363,6 +366,8 @@ export async function aiProcessAssistantChat({
     systemPromptLength: system.length,
     systemPrompt: system,
   });
+
+  const finalReply = createFinalReplyStep();
 
   const result = toolCallAgentStream({
     userAi: user.user,
@@ -391,6 +396,7 @@ export async function aiProcessAssistantChat({
           error: part.error,
         });
       }
+      finalReply.onStepEnd(step);
       await onStepEnd?.(step);
     },
     onModelResolved: (resolvedModel) => {
@@ -404,14 +410,18 @@ export async function aiProcessAssistantChat({
     },
     onEnd,
     stopWhen: () => false,
-    prepareStep: ({ messages: stepMessages }) => {
+    createSteering: finalReply.createSteering,
+    prepareStep: ({
+      messages: stepMessages,
+      experimental_steeringMessages: steeringMessages,
+    }) => {
       const trimmedMessages = trimStaleToolResults(stepMessages);
       const messages =
         trimmedMessages === stepMessages ? undefined : trimmedMessages;
 
       if (
-        Date.now() - startedAt <
-        ASSISTANT_CHAT_TOOL_BUDGET_MS[responseSurface]
+        !finalReply.isFinalReplyStep(steeringMessages) &&
+        Date.now() - startedAt < ASSISTANT_CHAT_TOOL_BUDGET_MS[responseSurface]
       )
         return messages && { messages };
 
@@ -951,7 +961,8 @@ function getFormattingRules(
   const markdownRules = `Formatting rules:
 - Always use markdown formatting. Structure multi-part answers with markdown headers (## for sections).
 - When listing many emails, use a numbered list so the user can reference items by number.
-- When grouping emails (e.g. triage), use a markdown header (##) for each group and a numbered list under it.
+- When grouping emails (e.g. triage), use a markdown header (##) for each group and a numbered list under it. Continue numbering across groups (two groups of 4 are 1–8, not 1–4 twice).
+- Say what each email actually contains — its concrete ask, news, or detail (amounts, dates, requested actions) — so the user understands it without opening it. Do not just restate the group header or a recommendation like "worth deciding whether to reply". Default to one sentence per email; use two only when it has distinct parts the user needs to know. Never pad.
 - Emojis are welcome when they improve tone or readability.
 - Do not present multi-option menus unless the user explicitly asks for options, or a safety-critical scope decision is required.
 - Prefer one recommended next step plus one direct confirmation question.
@@ -965,17 +976,12 @@ function getFormattingRules(
   return `${markdownRules}
 
 Inline email cards:
-- For triage or inbox summary, render <email> tags inside an <emails> container.
-- Format:
-<emails>
-<email index="1" threadid="THREAD_ID">Brief context</email>
-<email index="2" threadid="THREAD_ID">Brief context</email>
-</emails>
-- Number every <email> starting from 1, continuing across blocks within the same response (two groups of 4 are 1–8, not 1–4 twice). The index lets you map "#6" back to its threadid in later turns even if the list changes.
-- For a single email or thread, use <email-detail threadid="THREAD_ID">Brief context</email-detail>.
+- When your reply discusses specific emails (triage, inbox summary), put an empty card right after the text about each one:
+## Needs a reply
+1. Your sentence about the email.
+<email threadid="THREAD_ID"></email>
+- To show one email or thread in full, use <email-detail threadid="THREAD_ID"></email-detail> after your text about it.
+- Cards show the sender, subject, and date and let the user open and act on the email. Your text carries the meaning, so leave every card empty and don't repeat the subject or date in your text.
 - The threadid must be a threadId from searchInbox results (not the HTML id).
-- Inner text must say what the email actually contains — its concrete ask, news, or detail (amounts, dates, requested actions) — drawn from the subject and snippet, so the user understands it without opening it. Do not just restate the group header or a recommendation like "worth deciding whether to reply"; the header already conveys what to do. Default to one sentence; use two only when the email has distinct parts the user needs to know. Never pad.
-- The UI resolves sender, subject, and date from the threadId — don't repeat them.
-- Group <emails> blocks under markdown ## headers when triage has categories.
 - Only render email widgets when they add clarity, not for every search result.`;
 }

@@ -1139,12 +1139,6 @@ export class OutlookProvider implements EmailProvider {
     }
   }
 
-  async getPreviousConversationMessages(
-    messageIds: string[],
-  ): Promise<ParsedMessage[]> {
-    return this.getMessagesBatch(messageIds);
-  }
-
   async removeThreadLabel(threadId: string, labelId: string): Promise<void> {
     // Get the label to convert ID to name (Outlook uses names)
     // NOTE: if we have name already, we can skip this step. But because we let users use custom ids and we're not storing the custom category name, we need to first fetch the name.
@@ -1991,6 +1985,8 @@ export class OutlookProvider implements EmailProvider {
   }> {
     const senderFilter = options.query?.fromEmail?.trim();
     const domainFilter = senderFilter?.startsWith("@") ? senderFilter : null;
+    // Graph can't reliably filter on recipients, so pages are scanned here.
+    const recipientFilter = options.query?.toEmail?.trim() || null;
 
     const {
       fromEmail,
@@ -2059,7 +2055,9 @@ export class OutlookProvider implements EmailProvider {
             this.logger,
           )
         : new Set<string>();
-    const filtersPagesLocally = Boolean(domainFilter || excludedFolderIds.size);
+    const filtersPagesLocally = Boolean(
+      domainFilter || recipientFilter || excludedFolderIds.size,
+    );
     const maxResults = options.maxResults || 50;
 
     const fetchThreadPage = async (pageToken?: string) => {
@@ -2164,6 +2162,19 @@ export class OutlookProvider implements EmailProvider {
           matchesSenderFilter(
             message.from?.emailAddress?.address ?? "",
             domainFilter,
+          ),
+        );
+      }
+      if (recipientFilter) {
+        response.value = response.value.filter((message: Message) =>
+          [
+            ...(message.toRecipients ?? []),
+            ...(message.ccRecipients ?? []),
+          ].some((recipient) =>
+            matchesSenderFilter(
+              recipient.emailAddress?.address ?? "",
+              recipientFilter,
+            ),
           ),
         );
       }
