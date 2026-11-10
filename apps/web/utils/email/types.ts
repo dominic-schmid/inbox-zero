@@ -409,6 +409,8 @@ export interface EmailProvider {
     date: Date;
     messageId: string;
   }): Promise<boolean>;
+  /** Whether the folder still exists outside Deleted Items. */
+  isFolderAvailable(folderId: string): Promise<boolean>;
   isReplyInThread(message: ParsedMessage): boolean;
   isSentMessage(message: ParsedMessage): boolean;
   labelMessage(options: {

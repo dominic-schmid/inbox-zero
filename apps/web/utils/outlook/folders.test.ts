@@ -3,6 +3,7 @@ import { Client } from "@microsoft/microsoft-graph-client";
 import {
   getOrCreateOutlookFolderIdByName,
   getOutlookFolderTree,
+  isOutlookFolderAvailable,
   getOutlookRootFolders,
   getOutlookChildFolders,
   addOutlookSystemFolderTypes,
@@ -112,6 +113,180 @@ describe("getOrCreateOutlookFolderIdByName", () => {
   });
 });
 
+describe("getOrCreateOutlookFolderIdByName with a folder path", () => {
+  it("reuses existing levels and creates the missing ones under their parent", async () => {
+    const mailbox = createFakeMailbox([{ id: "bills-id", name: "Bills" }]);
+
+    const id = await getOrCreateOutlookFolderIdByName(
+      mailbox.client,
+      "Bills ⦙ Phone ⦙ 2026",
+      logger,
+    );
+
+    expect(mailbox.created).toEqual([
+      { parent: "bills-id", name: "Phone" },
+      { parent: "created-1", name: "2026" },
+    ]);
+    expect(id).toBe("created-2");
+  });
+
+  it("finds an existing nested folder without creating anything", async () => {
+    const mailbox = createFakeMailbox([
+      { id: "bills-id", name: "Bills" },
+      { id: "phone-id", name: "Phone", parent: "bills-id" },
+    ]);
+
+    const id = await getOrCreateOutlookFolderIdByName(
+      mailbox.client,
+      "Bills ⦙ Phone",
+      logger,
+    );
+
+    expect(id).toBe("phone-id");
+    expect(mailbox.created).toEqual([]);
+  });
+
+  it.each([
+    ["a separator character without its spaces", "A⦙B"],
+    ["a separator missing one space", "Bills ⦙Phone"],
+    ["a separator character inside a level", "Bills ⦙ Ph⦙one"],
+    ["a leading separator", " ⦙ Bills"],
+    ["a trailing separator", "Bills ⦙ "],
+    ["an empty middle level", "Bills ⦙  ⦙ Phone"],
+    ["only a separator", " ⦙ "],
+  ])("refuses a path with %s before touching the mailbox", async (_case, path) => {
+    const mailbox = createFakeMailbox([]);
+
+    await expect(
+      getOrCreateOutlookFolderIdByName(mailbox.client, path, logger),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(mailbox.requests).toEqual([]);
+  });
+
+  it("matches a nested level case-insensitively after a conflict", async () => {
+    const mailbox = createFakeMailbox(
+      [
+        { id: "bills-id", name: "Bills" },
+        { id: "phone-id", name: "PHONE", parent: "bills-id" },
+      ],
+      { hideFromFilter: ["phone-id"], caseInsensitiveConflicts: true },
+    );
+
+    const id = await getOrCreateOutlookFolderIdByName(
+      mailbox.client,
+      "Bills ⦙ Phone",
+      logger,
+    );
+
+    expect(id).toBe("phone-id");
+    expect(mailbox.created).toEqual([]);
+  });
+
+  it("keeps a slash as part of a top-level folder name", async () => {
+    const mailbox = createFakeMailbox([]);
+
+    await getOrCreateOutlookFolderIdByName(
+      mailbox.client,
+      "Receipts/2024",
+      logger,
+    );
+
+    expect(mailbox.created).toEqual([{ parent: null, name: "Receipts/2024" }]);
+  });
+
+  it("uses the existing child when its creation reports it already exists", async () => {
+    const mailbox = createFakeMailbox(
+      [
+        { id: "bills-id", name: "Bills" },
+        { id: "phone-id", name: "Phone", parent: "bills-id" },
+      ],
+      { hideFromFilter: ["phone-id"] },
+    );
+
+    const id = await getOrCreateOutlookFolderIdByName(
+      mailbox.client,
+      "Bills ⦙ Phone",
+      logger,
+    );
+
+    expect(id).toBe("phone-id");
+  });
+});
+
+describe("isOutlookFolderAvailable", () => {
+  const folders: Record<string, { id: string; parentFolderId?: string }> = {
+    deleteditems: { id: "deleted-id", parentFolderId: "root-id" },
+    msgfolderroot: { id: "root-id", parentFolderId: "mailbox-id" },
+    "deleted-id": { id: "deleted-id", parentFolderId: "root-id" },
+    "bills-id": { id: "bills-id", parentFolderId: "root-id" },
+    "phone-id": { id: "phone-id", parentFolderId: "bills-id" },
+    "trashed-bills-id": {
+      id: "trashed-bills-id",
+      parentFolderId: "deleted-id",
+    },
+    "trashed-phone-id": {
+      id: "trashed-phone-id",
+      parentFolderId: "trashed-bills-id",
+    },
+  };
+  const serveFolders = (request: Request) => {
+    const folder = folders[requestedFolderId(request)];
+    return folder
+      ? Response.json(folder)
+      : Response.json(
+          { error: { code: "ErrorItemNotFound", message: "missing" } },
+          { status: 404 },
+        );
+  };
+  const { client } = createGraphClient(serveFolders);
+
+  it("accepts a nested folder outside Deleted Items", async () => {
+    expect(await isOutlookFolderAvailable(client, "phone-id", logger)).toBe(
+      true,
+    );
+  });
+
+  it("rejects a folder that no longer exists", async () => {
+    expect(await isOutlookFolderAvailable(client, "gone-id", logger)).toBe(
+      false,
+    );
+  });
+
+  it("rejects a folder deleted along with its parent", async () => {
+    expect(
+      await isOutlookFolderAvailable(client, "trashed-phone-id", logger),
+    ).toBe(false);
+  });
+
+  it("keeps the folder when Graph can't say where it is", async () => {
+    const { client: failingClient } = createGraphClient((request) =>
+      requestedFolderId(request) === "msgfolderroot"
+        ? Response.json(
+            { error: { code: "ServiceUnavailable", message: "down" } },
+            { status: 503 },
+          )
+        : serveFolders(request),
+    );
+
+    expect(
+      await isOutlookFolderAvailable(failingClient, "phone-id", logger),
+    ).toBe(true);
+  });
+
+  it("stops walking a parent chain that never reaches the mailbox root", async () => {
+    const { client: loopingClient, requests } = createGraphClient((request) =>
+      requestedFolderId(request) === "loop-id"
+        ? Response.json({ id: "loop-id", parentFolderId: "loop-id" })
+        : serveFolders(request),
+    );
+
+    expect(
+      await isOutlookFolderAvailable(loopingClient, "loop-id", logger),
+    ).toBe(true);
+    expect(requests.length).toBeLessThan(40);
+  });
+});
+
 describe("getOrCreateOutlookFolderIdByName conflict recovery", () => {
   it("rethrows the original conflict when the fallback listing fails", async () => {
     const { client } = createGraphClient((request) => {
@@ -136,7 +311,15 @@ describe("getOrCreateOutlookFolderIdByName conflict recovery", () => {
   });
 });
 
-function createGraphClient(handler: (request: Request) => Response) {
+function requestedFolderId(request: Request) {
+  return decodeURIComponent(
+    new URL(request.url).pathname.split("/mailFolders/")[1] ?? "",
+  );
+}
+
+function createGraphClient(
+  handler: (request: Request) => Response | Promise<Response>,
+) {
   const requests: Request[] = [];
   const graph = Client.initWithMiddleware({
     middleware: {
@@ -146,12 +329,72 @@ function createGraphClient(handler: (request: Request) => Response) {
           context.options as RequestInit,
         );
         requests.push(request);
-        context.response = handler(request);
+        context.response = await handler(request);
       },
     },
   });
   const client = { getClient: () => graph } as unknown as OutlookClient;
   return { client, requests };
+}
+
+function createFakeMailbox(
+  initial: { id: string; name: string; parent?: string }[],
+  {
+    hideFromFilter = [],
+    caseInsensitiveConflicts = false,
+  }: { hideFromFilter?: string[]; caseInsensitiveConflicts?: boolean } = {},
+) {
+  const folders = initial.map((folder) => ({
+    ...folder,
+    parent: folder.parent ?? null,
+  }));
+  const created: { parent: string | null; name: string }[] = [];
+  const { client, requests } = createGraphClient(async (request) => {
+    const url = new URL(request.url);
+    const parentMatch = url.pathname.match(
+      /mailFolders\/([^/]+)\/childFolders/,
+    );
+    const parent = parentMatch ? decodeURIComponent(parentMatch[1]) : null;
+    const siblings = folders.filter((folder) => folder.parent === parent);
+
+    if (request.method === "POST") {
+      const { displayName } = (await request.json()) as { displayName: string };
+      const sameName = (name: string) =>
+        caseInsensitiveConflicts
+          ? name.toLowerCase() === displayName.toLowerCase()
+          : name === displayName;
+      if (siblings.some((folder) => sameName(folder.name))) {
+        return Response.json(
+          { error: { code: "ErrorFolderExists", message: "exists" } },
+          { status: 409 },
+        );
+      }
+      const folder = {
+        id: `created-${created.length + 1}`,
+        name: displayName,
+        parent,
+      };
+      folders.push(folder);
+      created.push({ parent, name: displayName });
+      return Response.json({ id: folder.id, displayName });
+    }
+
+    const filter = url.searchParams.get("$filter");
+    const matches = filter
+      ? siblings.filter(
+          (folder) =>
+            !hideFromFilter.includes(folder.id) &&
+            filter === `displayName eq '${folder.name}'`,
+        )
+      : siblings;
+    return Response.json({
+      value: matches.map((folder) => ({
+        id: folder.id,
+        displayName: folder.name,
+      })),
+    });
+  });
+  return { client, created, requests };
 }
 
 function createMockClient(

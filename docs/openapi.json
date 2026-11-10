@@ -3,7 +3,10 @@
   "info": {
     "title": "Inbox Zero API",
     "version": "1.0.0",
-    "description": "Programmatic access to Inbox Zero inbox stats, automation rules, and sender unsubscribe. Docs: https://docs.getinboxzero.com/api-reference/introduction Machine-readable schema: /openapi.json Authenticate with an account-scoped API key via the API-Key header. Errors return JSON with error.code, error.message, and error.hint."
+    "description": "Programmatic access to Inbox Zero inbox stats, automation rules, and sender unsubscribe. Docs: https://docs.getinboxzero.com/api-reference/introduction Machine-readable schema: /openapi.json Authenticate with an account-scoped API key via the API-Key header. Errors return JSON with error.code, error.message, and error.hint.",
+    "x-inbox-zero-capabilities": [
+      "outlook-folder-paths"
+    ]
   },
   "servers": [
     {
@@ -952,7 +955,8 @@
                               "type": [
                                 "string",
                                 "null"
-                              ]
+                              ],
+                              "description": "Outlook only, for MOVE_FOLDER. A top-level folder name, or a path to a nested folder with each level separated by \" ⦙ \" (space, U+2999, space), for example \"Bills ⦙ Phone\"; no level may be empty. \"⦙\" may appear only in that separator. Every other character, including \"/\", is part of a folder name, so \"Receipts/2024\" is one top-level folder. Missing folders on the path are created. Rules read back from the API return folderName in this same format."
                             }
                           }
                         },
@@ -1788,7 +1792,8 @@
                               "type": [
                                 "string",
                                 "null"
-                              ]
+                              ],
+                              "description": "Outlook only, for MOVE_FOLDER. A top-level folder name, or a path to a nested folder with each level separated by \" ⦙ \" (space, U+2999, space), for example \"Bills ⦙ Phone\"; no level may be empty. \"⦙\" may appear only in that separator. Every other character, including \"/\", is part of a folder name, so \"Receipts/2024\" is one top-level folder. Missing folders on the path are created. Rules read back from the API return folderName in this same format."
                             }
                           }
                         },

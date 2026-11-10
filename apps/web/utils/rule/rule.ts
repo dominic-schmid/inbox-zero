@@ -431,8 +431,18 @@ export async function updateRule({
       actionTypes: result.actions.map((action) => action.type),
     });
 
+    const actions = needsStoredFolderIds(result.actions)
+      ? withStoredFolderIds(
+          result.actions,
+          await prisma.action.findMany({
+            where: { ruleId, emailAccountId, type: ActionType.MOVE_FOLDER },
+            select: { folderName: true, folderId: true },
+          }),
+        )
+      : result.actions;
+
     const mappedActions = await mapActionFields(
-      result.actions,
+      actions,
       provider,
       emailAccountId,
       logger,
@@ -571,7 +581,7 @@ export async function updateRuleActions({
     where: { id: ruleId, emailAccountId },
     select: {
       from: true,
-      actions: { select: { type: true } },
+      actions: { select: { type: true, folderName: true, folderId: true } },
     },
   });
 
@@ -588,7 +598,7 @@ export async function updateRuleActions({
   });
 
   const mappedActions = await mapActionFields(
-    actions,
+    withStoredFolderIds(actions, existingRule.actions),
     provider,
     emailAccountId,
     logger,
@@ -715,6 +725,8 @@ type MappableAction = CreateOrUpdateRuleSchema["actions"][number] & {
   messagingChannelId?: string | null;
   labelId?: string | null;
   folderId?: string | null;
+  /** The folder an existing action files into; used only while it is still available. */
+  storedFolderId?: string | null;
   integrationName?: string | null;
   integrationToolName?: string | null;
   integrationArgs?: Prisma.JsonValue | null;
@@ -775,7 +787,11 @@ async function mapActionFields(
           logger,
         });
 
-        folderId = await emailProvider.getOrCreateFolderIdByName(folderName);
+        folderId =
+          a.storedFolderId &&
+          (await emailProvider.isFolderAvailable(a.storedFolderId))
+            ? a.storedFolderId
+            : await emailProvider.getOrCreateFolderIdByName(folderName);
       }
 
       const integrationFields =
@@ -1018,5 +1034,44 @@ function addNestedActionOwnershipToInputs(
       actionWithSupportedDelay,
       emailAccountId,
     );
+  });
+}
+
+function needsStoredFolderIds(actions: MappableAction[]) {
+  return actions.some(
+    (action) =>
+      action.type === ActionType.MOVE_FOLDER &&
+      !action.folderId &&
+      !!action.fields?.folderName,
+  );
+}
+
+/**
+ * Callers that only send a folder name (the public API, MCP, the assistant)
+ * keep the folder the rule already files into while the name is unchanged and
+ * that folder still exists. Resolving the name again would create a second
+ * folder once the original was moved or renamed in the mailbox. Names compare
+ * case-insensitively, as Outlook compares folder names.
+ */
+function withStoredFolderIds(
+  actions: MappableAction[],
+  storedActions: { folderName: string | null; folderId: string | null }[],
+): MappableAction[] {
+  if (!needsStoredFolderIds(actions)) return actions;
+  const folderIdByName = new Map(
+    storedActions.flatMap((action) =>
+      action.folderName && action.folderId
+        ? [[action.folderName.toLowerCase(), action.folderId] as const]
+        : [],
+    ),
+  );
+  return actions.map((action) => {
+    const folderName = action.fields?.folderName;
+    const storedFolderId =
+      action.type === ActionType.MOVE_FOLDER &&
+      !action.folderId &&
+      folderName &&
+      folderIdByName.get(folderName.toLowerCase());
+    return storedFolderId ? { ...action, storedFolderId } : action;
   });
 }

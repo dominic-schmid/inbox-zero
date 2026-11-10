@@ -61,7 +61,12 @@ const actionSchema = z
         subject: z.string().nullish(),
         content: z.string().nullish(),
         webhookUrl: z.string().nullish(),
-        folderName: z.string().nullish(),
+        folderName: z
+          .string()
+          .nullish()
+          .describe(
+            'Outlook only, for MOVE_FOLDER. A top-level folder name, or a path to a nested folder with each level separated by " ⦙ " (space, U+2999, space), for example "Bills ⦙ Phone"; no level may be empty. "⦙" may appear only in that separator. Every other character, including "/", is part of a folder name, so "Receipts/2024" is one top-level folder. Missing folders on the path are created. Rules read back from the API return folderName in this same format.',
+          ),
       })
       .nullish(),
     delayInMinutes: z

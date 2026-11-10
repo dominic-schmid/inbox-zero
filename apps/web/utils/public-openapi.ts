@@ -76,6 +76,9 @@ export function createPublicOpenApiDocument() {
         "Authenticate with an account-scoped API key via the API-Key header.",
         "Errors return JSON with error.code, error.message, and error.hint.",
       ].join(" "),
+      // Lets clients check a server for behavior the version string does not
+      // track. "outlook-folder-paths": MOVE_FOLDER folderName nests on " ⦙ ".
+      "x-inbox-zero-capabilities": ["outlook-folder-paths"],
     },
     servers: [
       {
