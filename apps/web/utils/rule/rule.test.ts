@@ -5,6 +5,7 @@ import { createEmailProvider } from "@/utils/email/provider";
 import { DELETE_EMAIL_ACTION_DISABLED_MESSAGE } from "@/utils/delete-email-action";
 import { WEBHOOK_ACTION_DISABLED_MESSAGE } from "@/utils/outbound-webhook/action";
 import { getActionRiskLevel } from "@/utils/risk";
+import { isMicrosoftProvider } from "@/utils/email/provider-types";
 
 const {
   createRuleHistoryMock,
@@ -700,6 +701,130 @@ describe("updateRuleActions", () => {
   });
 });
 
+describe("folder ids on rule updates", () => {
+  const getOrCreateFolderIdByName = vi.fn();
+  const isFolderAvailable = vi.fn();
+
+  beforeEach(() => {
+    resetRuleMocks();
+    vi.mocked(isMicrosoftProvider).mockReturnValue(true);
+    vi.mocked(createEmailProvider).mockResolvedValue({
+      getOrCreateFolderIdByName,
+      isFolderAvailable,
+    } as any);
+    getOrCreateFolderIdByName.mockResolvedValue("resolved-id");
+    isFolderAvailable.mockResolvedValue(true);
+    prisma.rule.findFirst.mockResolvedValue({
+      from: null,
+      actions: [
+        {
+          type: ActionType.MOVE_FOLDER,
+          folderName: "Bills ⦙ Phone",
+          folderId: "moved-phone-id",
+        },
+      ],
+    } as any);
+    prisma.rule.update.mockResolvedValue({
+      id: RULE_ID,
+      actions: [],
+      group: null,
+    } as any);
+  });
+
+  it("keeps the folder the rule files into when the folder name is unchanged", async () => {
+    await updateRuleActions({
+      ruleId: RULE_ID,
+      actions: [moveFolderAction("Bills ⦙ Phone")],
+      provider: "microsoft",
+      emailAccountId: EMAIL_ACCOUNT_ID,
+      logger,
+    });
+
+    expect(isFolderAvailable).toHaveBeenCalledWith("moved-phone-id");
+    expect(getOrCreateFolderIdByName).not.toHaveBeenCalled();
+    expect(savedActions()).toEqual([
+      expect.objectContaining({
+        folderName: "Bills ⦙ Phone",
+        folderId: "moved-phone-id",
+      }),
+    ]);
+  });
+
+  it("keeps the folder when only the case of its name changed", async () => {
+    await updateRuleActions({
+      ruleId: RULE_ID,
+      actions: [moveFolderAction("bills ⦙ phone")],
+      provider: "microsoft",
+      emailAccountId: EMAIL_ACCOUNT_ID,
+      logger,
+    });
+
+    expect(getOrCreateFolderIdByName).not.toHaveBeenCalled();
+    expect(savedActions()).toEqual([
+      expect.objectContaining({ folderId: "moved-phone-id" }),
+    ]);
+  });
+
+  it("resolves the name again when the stored folder was deleted", async () => {
+    isFolderAvailable.mockResolvedValue(false);
+
+    await updateRuleActions({
+      ruleId: RULE_ID,
+      actions: [moveFolderAction("Bills ⦙ Phone")],
+      provider: "microsoft",
+      emailAccountId: EMAIL_ACCOUNT_ID,
+      logger,
+    });
+
+    expect(getOrCreateFolderIdByName).toHaveBeenCalledWith("Bills ⦙ Phone");
+    expect(savedActions()).toEqual([
+      expect.objectContaining({ folderId: "resolved-id" }),
+    ]);
+  });
+
+  it("resolves the folder again when the folder name changes", async () => {
+    await updateRuleActions({
+      ruleId: RULE_ID,
+      actions: [moveFolderAction("Bills ⦙ Mobile")],
+      provider: "microsoft",
+      emailAccountId: EMAIL_ACCOUNT_ID,
+      logger,
+    });
+
+    expect(getOrCreateFolderIdByName).toHaveBeenCalledWith("Bills ⦙ Mobile");
+    expect(savedActions()).toEqual([
+      expect.objectContaining({ folderId: "resolved-id" }),
+    ]);
+  });
+
+  it("keeps the stored folder when the public API re-saves a rule by name", async () => {
+    prisma.rule.findUnique.mockResolvedValue({ groupId: null } as any);
+    prisma.action.findMany.mockResolvedValue([
+      { folderName: "Bills ⦙ Phone", folderId: "moved-phone-id" },
+    ] as any);
+
+    await updateRule({
+      ruleId: RULE_ID,
+      result: createRuleResult({
+        actions: [moveFolderAction("Bills ⦙ Phone")],
+      }),
+      emailAccountId: EMAIL_ACCOUNT_ID,
+      provider: "microsoft",
+      logger,
+    });
+
+    expect(getOrCreateFolderIdByName).not.toHaveBeenCalled();
+    expect(savedActions()).toEqual([
+      expect.objectContaining({ folderId: "moved-phone-id" }),
+    ]);
+  });
+
+  function savedActions() {
+    const update = prisma.rule.update.mock.calls[0]?.[0] as any;
+    return update.data.actions.createMany.data;
+  }
+});
+
 describe("rule history snapshots", () => {
   beforeEach(resetRuleMocks);
 
@@ -1158,6 +1283,14 @@ function createRuleResult({
     },
     actions,
   };
+}
+
+function moveFolderAction(folderName: string): RuleAction {
+  return {
+    type: ActionType.MOVE_FOLDER,
+    fields: { folderName } as any,
+    delayInMinutes: null,
+  } as RuleAction;
 }
 
 function archiveAction(): RuleAction {

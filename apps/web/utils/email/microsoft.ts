@@ -137,6 +137,7 @@ import {
   addOutlookSystemFolderTypes,
   deleteOutlookFolder,
   renameOutlookFolder,
+  isOutlookFolderAvailable,
 } from "@/utils/outlook/folders";
 import { extractSignatureFromHtml } from "@/utils/email/signature-extraction";
 import {
@@ -2698,6 +2699,10 @@ export class OutlookProvider implements EmailProvider {
       folderName,
       this.logger,
     );
+  }
+
+  async isFolderAvailable(folderId: string): Promise<boolean> {
+    return await isOutlookFolderAvailable(this.client, folderId, this.logger);
   }
 
   async renameFolder(folderId: string, name: string): Promise<void> {

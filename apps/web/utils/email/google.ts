@@ -2157,6 +2157,10 @@ export class GmailProvider implements EmailProvider {
       .filter((email): email is string => !!email);
   }
 
+  async isFolderAvailable(_folderId: string): Promise<boolean> {
+    return false;
+  }
+
   async renameFolder(_folderId: string, _name: string): Promise<void> {
     this.logger.warn("Renaming folders is not supported for Gmail");
   }

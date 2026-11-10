@@ -5,6 +5,8 @@ import {
   encodeODataFilter,
   escapeODataString,
 } from "@/utils/outlook/odata-escape";
+import { SafeError } from "@/utils/error";
+import { isNotFoundError } from "@/utils/outlook/errors";
 import { resolveMicrosoftGraphNextLink } from "@/utils/outlook/page-token";
 import {
   withMicrosoftGraphRetry,
@@ -25,6 +27,10 @@ const OUTLOOK_FOLDER_FIELDS =
 // Should not use a common separator like "/|\>" as it may be used in the folder name.
 // Using U+2999 as it is unlikely to appear in normal text
 export const FOLDER_SEPARATOR = " ⦙ ";
+export const FOLDER_SEPARATOR_CHARACTER = FOLDER_SEPARATOR.trim();
+
+// Outlook allows deeper nesting, but a chain longer than this is not a mailbox.
+const MAX_FOLDER_DEPTH = 32;
 
 export type OutlookFolder = {
   id: NonNullable<MailFolder["id"]>;
@@ -94,6 +100,7 @@ export async function getOutlookChildFolders(
 async function findOutlookFolderByName(
   client: OutlookClient,
   folderName: string,
+  parentId: string | undefined,
   logger: Logger,
 ): Promise<OutlookFolder | undefined> {
   try {
@@ -101,7 +108,7 @@ async function findOutlookFolderByName(
       () =>
         client
           .getClient()
-          .api("/me/mailFolders")
+          .api(getFolderCollectionPath(parentId))
           .filter(
             encodeODataFilter(
               `displayName eq '${escapeODataString(folderName)}'`,
@@ -211,56 +218,95 @@ export function addOutlookSystemFolderTypes(
   }));
 }
 
+/**
+ * Resolves a folder name or a FOLDER_SEPARATOR path ("Bills ⦙ Phone"),
+ * creating any missing level. Every other character, "/" included, is part of
+ * a folder name.
+ */
 export async function getOrCreateOutlookFolderIdByName(
   client: OutlookClient,
   folderName: string,
   logger: Logger,
 ): Promise<string> {
-  const existingFolder = await findOutlookFolderByName(
-    client,
-    folderName,
-    logger,
-  );
-
-  if (existingFolder) {
-    return existingFolder.id;
-  }
-
-  try {
-    const response = await withMicrosoftGraphWriteRetry(
-      () =>
-        client.getClient().api("/me/mailFolders").post({
-          displayName: folderName,
-        }),
+  let parentId: string | undefined;
+  for (const segment of splitOutlookFolderPath(folderName)) {
+    parentId = await getOrCreateOutlookFolderId(
+      client,
+      segment,
+      parentId,
       logger,
     );
-
-    return response.id;
-  } catch (error) {
-    // The folder can appear between the lookup and the create, or the lookup itself can fail.
-    // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
-    const err = error as any;
-    if (err?.code === "ErrorFolderExists" || err?.statusCode === 409) {
-      logger.info("Folder already exists, fetching existing folder", {
-        folderName,
-      });
-      const folder =
-        (await findOutlookFolderByName(client, folderName, logger)) ??
-        (await findRootOutlookFolderByListing(client, folderName, logger).catch(
-          (listingError) => {
-            logger.warn("Error listing folders to find existing folder", {
-              folderName,
-              error: listingError,
-            });
-            return;
-          },
-        ));
-      if (folder) {
-        return folder.id;
-      }
-    }
-    throw error;
   }
+  // splitOutlookFolderPath always returns at least one segment.
+  return parentId!;
+}
+
+/**
+ * Whether mail can still be filed into a folder known by id: it exists and is
+ * not in Deleted Items, where a deleted folder lands with its subfolders.
+ * When Graph can't answer, the folder counts as available: resolving the name
+ * again would create a second folder next to one that is most likely fine.
+ */
+export async function isOutlookFolderAvailable(
+  client: OutlookClient,
+  folderId: string,
+  logger: Logger,
+): Promise<boolean> {
+  const getFolder = async (id: string) => {
+    try {
+      const folder: MailFolder = await withMicrosoftGraphRetry(
+        () =>
+          client
+            .getClient()
+            .api(`/me/mailFolders/${encodeURIComponent(id)}`)
+            .select("id,parentFolderId")
+            .get(),
+        logger,
+      );
+      return folder;
+    } catch (error) {
+      if (isNotFoundError(error)) return null;
+      throw error;
+    }
+  };
+
+  try {
+    const [folder, deletedItems, root] = await Promise.all([
+      getFolder(folderId),
+      getFolder("deleteditems"),
+      getFolder("msgfolderroot"),
+    ]);
+    if (!folder) return false;
+
+    let current: MailFolder | null = folder;
+    for (let depth = 0; current && depth < MAX_FOLDER_DEPTH; depth++) {
+      if (current.id === deletedItems?.id) return false;
+      if (!current.parentFolderId || current.parentFolderId === root?.id)
+        return true;
+      current = await getFolder(current.parentFolderId);
+    }
+    return true;
+  } catch (error) {
+    logger.warn("Could not check folder, keeping it", { folderId, error });
+    return true;
+  }
+}
+
+/** Without a parent the folder is created at the top level of the mailbox. */
+async function createOutlookFolder(
+  client: OutlookClient,
+  { name, parentId }: { name: string; parentId?: string },
+  logger: Logger,
+): Promise<OutlookFolder> {
+  const folder: MailFolder = await withMicrosoftGraphWriteRetry(
+    () =>
+      client
+        .getClient()
+        .api(getFolderCollectionPath(parentId))
+        .post({ displayName: name }),
+    logger,
+  );
+  return convertMailFolderToOutlookFolder(folder);
 }
 
 export async function renameOutlookFolder(
@@ -310,9 +356,59 @@ export function flattenOutlookFolders(
 }
 
 // Outlook folder names are unique case-insensitively among siblings.
-async function findRootOutlookFolderByListing(
+async function getOrCreateOutlookFolderId(
   client: OutlookClient,
   folderName: string,
+  parentId: string | undefined,
+  logger: Logger,
+): Promise<string> {
+  const existingFolder = await findOutlookFolderByName(
+    client,
+    folderName,
+    parentId,
+    logger,
+  );
+  if (existingFolder) return existingFolder.id;
+
+  try {
+    const folder = await createOutlookFolder(
+      client,
+      { name: folderName, parentId },
+      logger,
+    );
+    return folder.id;
+  } catch (error) {
+    // The folder can appear between the lookup and the create, or the lookup itself can fail.
+    // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
+    const err = error as any;
+    if (err?.code === "ErrorFolderExists" || err?.statusCode === 409) {
+      logger.info("Folder already exists, fetching existing folder", {
+        folderName,
+      });
+      const folder =
+        (await findOutlookFolderByName(client, folderName, parentId, logger)) ??
+        (await findOutlookFolderByListing(
+          client,
+          folderName,
+          parentId,
+          logger,
+        ).catch((listingError) => {
+          logger.warn("Error listing folders to find existing folder", {
+            folderName,
+            error: listingError,
+          });
+          return;
+        }));
+      if (folder) return folder.id;
+    }
+    throw error;
+  }
+}
+
+async function findOutlookFolderByListing(
+  client: OutlookClient,
+  folderName: string,
+  parentId: string | undefined,
   logger: Logger,
 ): Promise<OutlookFolder | undefined> {
   const normalizedName = folderName.toLowerCase();
@@ -326,7 +422,7 @@ async function findRootOutlookFolderByListing(
             ? client.getClient().api(link).get()
             : client
                 .getClient()
-                .api("/me/mailFolders")
+                .api(getFolderCollectionPath(parentId))
                 .select("id,displayName")
                 .top(999)
                 .get(),
@@ -339,4 +435,36 @@ async function findRootOutlookFolderByListing(
     nextLink =
       resolveMicrosoftGraphNextLink(response["@odata.nextLink"]) ?? undefined;
   } while (nextLink);
+}
+
+function getFolderCollectionPath(parentId: string | undefined) {
+  return parentId
+    ? `/me/mailFolders/${encodeURIComponent(parentId)}/childFolders`
+    : "/me/mailFolders";
+}
+
+/**
+ * Only FOLDER_SEPARATOR, spaces included, separates levels. A "⦙" anywhere
+ * else and an empty level are refused rather than guessed at: "Bills ⦙Phone"
+ * is almost always a mistyped path, not a folder name.
+ */
+function splitOutlookFolderPath(folderName: string): string[] {
+  const levels = folderName.split(FOLDER_SEPARATOR);
+  const segments =
+    levels.length > 1 ? levels.map((level) => level.trim()) : levels;
+  if (
+    segments.some((segment) => segment.includes(FOLDER_SEPARATOR_CHARACTER))
+  ) {
+    throw new SafeError(
+      `Folder path "${folderName}" uses "${FOLDER_SEPARATOR_CHARACTER}" outside the level separator "${FOLDER_SEPARATOR}".`,
+      400,
+    );
+  }
+  if (segments.some((segment) => !segment.trim())) {
+    throw new SafeError(
+      `Folder path "${folderName}" has an empty level. Separate each level with "${FOLDER_SEPARATOR}".`,
+      400,
+    );
+  }
+  return segments;
 }
