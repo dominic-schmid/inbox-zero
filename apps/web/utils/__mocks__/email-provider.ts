@@ -181,6 +181,12 @@ export const createMockEmailProvider = (
   getOrCreateFolderIdByName: vi.fn().mockResolvedValue("folder1"),
   renameFolder: vi.fn().mockResolvedValue(undefined),
   isFolderAvailable: vi.fn().mockResolvedValue(true),
+  createFolder: vi.fn().mockResolvedValue({
+    id: "folder1",
+    displayName: "Folder",
+    childFolders: [],
+  }),
+  moveFolder: vi.fn().mockResolvedValue(undefined),
   deleteFolder: vi.fn().mockResolvedValue(undefined),
   sendEmailWithHtml: vi.fn().mockResolvedValue(undefined),
   getDrafts: vi.fn().mockResolvedValue([]),

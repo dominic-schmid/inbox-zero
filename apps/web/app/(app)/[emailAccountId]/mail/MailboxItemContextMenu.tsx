@@ -1,7 +1,12 @@
 "use client";
 
 import { type FormEvent, type ReactNode, useState } from "react";
-import { PencilIcon, Trash2Icon } from "lucide-react";
+import {
+  FolderInputIcon,
+  FolderPlusIcon,
+  PencilIcon,
+  Trash2Icon,
+} from "lucide-react";
 import { toast } from "sonner";
 import {
   AlertDialog,
@@ -85,6 +90,7 @@ export function MailboxItemContextMenu({
   currentColor,
   colorOptions = [],
   visibility,
+  folderActions,
   onEdit,
   onDelete,
 }: {
@@ -99,6 +105,12 @@ export function MailboxItemContextMenu({
   colorOptions?: readonly MailboxItemColorOption[];
   /** Omitted for providers without visibility settings, which hides the menu section. */
   visibility?: MailboxItemVisibility;
+  folderActions?: {
+    onCreateSubfolder: () => void;
+    onMove: () => void;
+    /** Shown while renaming, such as which rules file into the folder. */
+    renameNotice?: ReactNode;
+  };
   onEdit: (edit: MailboxItemEdit) => Promise<boolean>;
   onDelete: (item: MailboxItem) => Promise<boolean>;
 }) {
@@ -200,6 +212,24 @@ export function MailboxItemContextMenu({
             <PencilIcon className="size-4" />
             Edit
           </ContextMenuItem>
+          {folderActions && (
+            <>
+              <ContextMenuItem
+                className="gap-2"
+                onSelect={folderActions.onCreateSubfolder}
+              >
+                <FolderPlusIcon className="size-4" />
+                New subfolder
+              </ContextMenuItem>
+              <ContextMenuItem
+                className="gap-2"
+                onSelect={folderActions.onMove}
+              >
+                <FolderInputIcon className="size-4" />
+                Move to…
+              </ContextMenuItem>
+            </>
+          )}
           <ContextMenuItem
             className="gap-2 text-destructive focus:text-destructive"
             onSelect={() => setIsDeleteOpen(true)}
@@ -264,6 +294,9 @@ export function MailboxItemContextMenu({
                 autoFocus
                 maxLength={255}
               />
+            )}
+            {showsName && folderActions?.renameNotice && (
+              <div className="mt-4">{folderActions.renameNotice}</div>
             )}
             {showsColor && (
               <div

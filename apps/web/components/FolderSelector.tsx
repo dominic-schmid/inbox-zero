@@ -6,6 +6,7 @@ import {
   FolderIcon,
   ChevronRight,
   Loader2,
+  PlusIcon,
   X,
 } from "lucide-react";
 import { cn } from "@/utils";
@@ -23,8 +24,14 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { FOLDER_SEPARATOR, type OutlookFolder } from "@/utils/outlook/folders";
+import {
+  FOLDER_SEPARATOR,
+  type OutlookFolder,
+  withoutNonFilingOutlookFolders,
+  withoutOutlookFolder,
+} from "@/utils/outlook/folders";
 import type { FieldError } from "react-hook-form";
+import { CreateFolderDialog } from "@/components/CreateFolderDialog";
 
 interface FolderItemProps {
   displayPath?: string;
@@ -80,7 +87,13 @@ function FolderItem({
 }
 
 interface FolderSelectorProps {
+  /** Offers creating a folder from the picker; the new folder gets selected. */
+  createFolder?: { emailAccountId: string; onCreated: () => void };
   error?: FieldError;
+  /** Leaves this folder and its subfolders out, such as when picking where to move it. */
+  excludeFolderId?: string;
+  /** Leaves out Drafts, Sent, Deleted Items, Junk and Outbox, with their subfolders. */
+  filingTargetsOnly?: boolean;
   folders: OutlookFolder[];
   isLoading: boolean;
   onChangeValue: (value: { name: string; id: string }) => void;
@@ -89,15 +102,25 @@ interface FolderSelectorProps {
 }
 
 export function FolderSelector({
-  folders,
+  folders: allFolders,
   isLoading,
   value,
   onChangeValue,
   placeholder = "Select a folder...",
   error,
+  excludeFolderId,
+  createFolder,
+  filingTargetsOnly,
 }: FolderSelectorProps) {
   const [open, setOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const targets = filingTargetsOnly
+    ? withoutNonFilingOutlookFolders(allFolders)
+    : allFolders;
+  const folders = excludeFolderId
+    ? withoutOutlookFolder(targets, excludeFolderId)
+    : targets;
 
   const findFolderById = (
     folderList: OutlookFolder[],
@@ -261,6 +284,21 @@ export function FolderSelector({
                       />
                     ))}
                   </CommandGroup>
+                  {createFolder && (
+                    <CommandGroup forceMount>
+                      <CommandItem
+                        forceMount
+                        value="create-folder"
+                        onSelect={() => {
+                          setOpen(false);
+                          setIsCreateOpen(true);
+                        }}
+                      >
+                        <PlusIcon className="mr-2 h-4 w-4" />
+                        Create folder…
+                      </CommandItem>
+                    </CommandGroup>
+                  )}
                 </>
               )}
             </CommandList>
@@ -284,6 +322,18 @@ export function FolderSelector({
         <div className="mt-1 text-sm text-red-600 dark:text-red-400">
           {error.message}
         </div>
+      )}
+      {createFolder && (
+        <CreateFolderDialog
+          open={isCreateOpen}
+          onOpenChange={setIsCreateOpen}
+          emailAccountId={createFolder.emailAccountId}
+          folders={allFolders}
+          onCreated={(folder) => {
+            onChangeValue({ name: folder.path, id: folder.id });
+            createFolder.onCreated();
+          }}
+        />
       )}
     </div>
   );

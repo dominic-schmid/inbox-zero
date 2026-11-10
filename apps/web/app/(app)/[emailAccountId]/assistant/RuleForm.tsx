@@ -179,7 +179,11 @@ export function RuleForm({
 
   const { userLabels, isLoading, mutate: mutateLabels } = useLabels();
   const { data: messagingChannelsData } = useMessagingChannels(emailAccountId);
-  const { folders, isLoading: foldersLoading } = useFolders(provider);
+  const {
+    folders,
+    isLoading: foldersLoading,
+    mutate: mutateFolders,
+  } = useFolders(provider);
   const router = useRouter();
 
   const posthog = usePostHog();
@@ -494,6 +498,7 @@ export function RuleForm({
             typeOptions={typeOptions}
             folders={folders}
             foldersLoading={foldersLoading}
+            onFoldersChanged={() => mutateFolders()}
             messagingChannels={messagingChannelsData?.channels ?? []}
             availableMessagingProviders={
               messagingChannelsData?.availableProviders ?? []

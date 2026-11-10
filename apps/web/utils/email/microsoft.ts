@@ -138,6 +138,8 @@ import {
   deleteOutlookFolder,
   renameOutlookFolder,
   isOutlookFolderAvailable,
+  createOutlookFolder,
+  moveOutlookFolder,
 } from "@/utils/outlook/folders";
 import { extractSignatureFromHtml } from "@/utils/email/signature-extraction";
 import {
@@ -2703,6 +2705,22 @@ export class OutlookProvider implements EmailProvider {
 
   async isFolderAvailable(folderId: string): Promise<boolean> {
     return await isOutlookFolderAvailable(this.client, folderId, this.logger);
+  }
+
+  async createFolder(name: string, parentId?: string) {
+    return await createOutlookFolder(
+      this.client,
+      { name, parentId },
+      this.logger,
+    );
+  }
+
+  async moveFolder(folderId: string, destinationId?: string): Promise<void> {
+    await moveOutlookFolder(
+      this.client,
+      { folderId, destinationId },
+      this.logger,
+    );
   }
 
   async renameFolder(folderId: string, name: string): Promise<void> {

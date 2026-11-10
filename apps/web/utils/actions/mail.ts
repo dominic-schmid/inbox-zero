@@ -10,7 +10,9 @@ import { DraftNotFoundError, SafeError } from "@/utils/error";
 import { createEmailProvider } from "@/utils/email/provider";
 import { sendHtmlEmailWithOpenTracking } from "@/utils/email/sent-message-open/sent-message-open.server";
 import {
+  createFolderBody,
   deleteMailboxItemBody,
+  moveFolderBody,
   unarchiveThreadBody,
   untrashThreadBody,
   updateMailboxItemBody,
@@ -25,6 +27,17 @@ import {
 import { isGmailLabelColor } from "@/utils/gmail/label-colors";
 import { getOutlookCategoryPreset } from "@/utils/outlook/category-colors";
 import { resetDefaultLabelColors } from "@/utils/label/reset-label-colors";
+import { ActionType } from "@/generated/prisma/enums";
+import type { Logger } from "@/utils/logger";
+import { isFolderExistsError } from "@/utils/outlook/errors";
+import {
+  FOLDER_SEPARATOR,
+  flattenOutlookFolders,
+  getOutlookFolderMoveProblem,
+  getOutlookFolderSubtree,
+  isOutlookFilingTarget,
+  type OutlookFolder,
+} from "@/utils/outlook/folders";
 
 import {
   saveComposeDraft,
@@ -306,8 +319,23 @@ export const updateMailboxItemAction = actionClient
       });
 
       try {
-        if (kind === "folder") await emailProvider.renameFolder(id, name!);
-        else
+        if (kind === "folder") {
+          const folders = await emailProvider.getFolders();
+          await emailProvider.renameFolder(id, name!);
+          const renamed = flattenOutlookFolders(folders).find(
+            (folder) => folder.id === id,
+          );
+          if (renamed) {
+            await syncStoredFolderPaths({
+              emailAccountId,
+              folders,
+              folderId: id,
+              newPath:
+                renamed.path.slice(0, -renamed.displayName.length) + name!,
+              logger,
+            });
+          }
+        } else
           await emailProvider.updateLabel(id, {
             name,
             color,
@@ -318,6 +346,90 @@ export const updateMailboxItemAction = actionClient
         logger.error("Failed to update mailbox item", { error, kind });
         throw new SafeError(`Failed to update ${kind}. Please try again.`);
       }
+    },
+  );
+
+export const createFolderAction = actionClient
+  .metadata({ name: "createFolder" })
+  .inputSchema(createFolderBody)
+  .action(
+    async ({
+      ctx: { emailAccountId, provider, logger },
+      parsedInput: { name, parentId },
+    }) => {
+      assertMailboxItemMutationSupported({ kind: "folder", provider });
+      const emailProvider = await createEmailProvider({
+        emailAccountId,
+        provider,
+        logger,
+      });
+
+      if (
+        parentId &&
+        !isOutlookFilingTarget(await emailProvider.getFolders(), parentId)
+      ) {
+        throw new SafeError("Folders can't be created there.");
+      }
+
+      try {
+        return await emailProvider.createFolder(name, parentId);
+      } catch (error) {
+        logger.error("Failed to create folder", { error });
+        throw new SafeError(
+          isFolderExistsError(error)
+            ? "A folder with that name already exists there."
+            : "Failed to create folder. Please try again.",
+        );
+      }
+    },
+  );
+
+export const moveFolderAction = actionClient
+  .metadata({ name: "moveFolder" })
+  .inputSchema(moveFolderBody)
+  .action(
+    async ({
+      ctx: { emailAccountId, provider, logger },
+      parsedInput: { id, destinationId },
+    }) => {
+      assertMailboxItemMutationSupported({ kind: "folder", provider });
+      const emailProvider = await createEmailProvider({
+        emailAccountId,
+        provider,
+        logger,
+      });
+
+      const folders = await emailProvider.getFolders();
+      const moveProblem = getOutlookFolderMoveProblem(
+        folders,
+        id,
+        destinationId,
+      );
+      if (moveProblem) throw new SafeError(moveProblem);
+
+      try {
+        await emailProvider.moveFolder(id, destinationId);
+      } catch (error) {
+        logger.error("Failed to move folder", { error });
+        throw new SafeError(
+          isFolderExistsError(error)
+            ? "A folder with that name already exists there."
+            : "Failed to move folder. Please try again.",
+        );
+      }
+
+      const flatFolders = flattenOutlookFolders(folders);
+      const name = flatFolders.find((folder) => folder.id === id)!.displayName;
+      const destinationPath = destinationId
+        ? flatFolders.find((folder) => folder.id === destinationId)!.path
+        : "";
+      await syncStoredFolderPaths({
+        emailAccountId,
+        folders,
+        folderId: id,
+        newPath: joinFolderPath(destinationPath, name),
+        logger,
+      });
     },
   );
 
@@ -550,3 +662,69 @@ export const discardComposeDraftAction = actionClient
       return { success: true };
     },
   );
+
+/**
+ * Rules file by folder id, so they follow a moved or renamed folder. The paths
+ * stored on rules filing into that folder or below it are updated to match,
+ * so the rule editor and the public API show where mail really goes. Other
+ * rules keep their stored path, which is what a config sync compares against.
+ * `folders` is the tree from before the change.
+ */
+async function syncStoredFolderPaths({
+  emailAccountId,
+  folders,
+  folderId,
+  newPath,
+  logger,
+}: {
+  emailAccountId: string;
+  folders: OutlookFolder[];
+  folderId: string;
+  newPath: string;
+  logger: Logger;
+}) {
+  // Rules filing into Deleted Items or Junk are left alone: their next save by
+  // name recreates the folder instead of filing into the trash.
+  if (!isOutlookFilingTarget(folders, folderId)) return;
+  const [folder, ...descendants] = getOutlookFolderSubtree(folders, folderId);
+  const pathById = new Map(
+    [folder, ...descendants].map((subfolder) => [
+      subfolder.id,
+      newPath + subfolder.path.slice(folder.displayName.length),
+    ]),
+  );
+
+  try {
+    const actions = await prisma.action.findMany({
+      where: {
+        emailAccountId,
+        type: ActionType.MOVE_FOLDER,
+        folderId: { in: [...pathById.keys()] },
+      },
+      select: { id: true, folderId: true, folderName: true },
+    });
+    const stale = actions.flatMap(({ id, folderId, folderName }) => {
+      const path = folderId && pathById.get(folderId);
+      return path && path !== folderName ? [{ id, folderId, path }] : [];
+    });
+    if (!stale.length) return;
+
+    await prisma.$transaction(
+      stale.map(({ id, folderId, path }) =>
+        // Matching the folder read above skips a rule re-pointed meanwhile.
+        prisma.action.updateMany({
+          where: { id, emailAccountId, folderId },
+          data: { folderName: path },
+        }),
+      ),
+    );
+  } catch (error) {
+    // The folder change itself succeeded; a stale path only affects what the
+    // rule shows, and the next save resolves it again.
+    logger.warn("Failed to update rule folder paths", { error });
+  }
+}
+
+function joinFolderPath(parentPath: string, name: string) {
+  return parentPath ? `${parentPath}${FOLDER_SEPARATOR}${name}` : name;
+}

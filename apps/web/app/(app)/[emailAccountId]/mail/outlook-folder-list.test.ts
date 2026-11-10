@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { OutlookFolder } from "@/utils/outlook/folders";
 import { FOLDER_SEPARATOR } from "@/utils/outlook/folders";
 import {
+  countRulesFilingInto,
+  getParentFolder,
   getMailSearchFolders,
   getMailSidebarFolders,
+  moveFolderInTree,
 } from "./outlook-folder-list";
 
 function folder(
@@ -80,5 +83,62 @@ describe("getMailSearchFolders", () => {
       { name: `inbox-id${FOLDER_SEPARATOR}Projects` },
       { name: "Clients" },
     ]);
+  });
+});
+
+describe("getParentFolder", () => {
+  const tree = [folder("bills", [folder("phone", [folder("2026")])])];
+
+  it("returns the parent with its path, or nothing at the top level", () => {
+    expect(getParentFolder(tree, "2026")).toEqual({
+      id: "phone",
+      path: `bills${FOLDER_SEPARATOR}phone`,
+    });
+    expect(getParentFolder(tree, "bills")).toBeUndefined();
+  });
+});
+
+describe("moveFolderInTree", () => {
+  it("moves the folder with its subfolders", () => {
+    const tree = [
+      folder("bills", [folder("phone", [folder("2026")])]),
+      folder("work"),
+    ];
+
+    const moved = moveFolderInTree(tree, "phone", "work");
+
+    expect(moved[0].childFolders).toEqual([]);
+    expect(moved[1].childFolders.map((child) => child.id)).toEqual(["phone"]);
+    expect(moved[1].childFolders[0].childFolders[0].id).toBe("2026");
+  });
+
+  it("moves a subfolder to the top level", () => {
+    const tree = [folder("bills", [folder("phone")])];
+
+    expect(moveFolderInTree(tree, "phone").map((f) => f.id)).toEqual([
+      "bills",
+      "phone",
+    ]);
+  });
+});
+
+describe("countRulesFilingInto", () => {
+  it("counts rules moving mail into the folder or its subfolders once each", () => {
+    const tree = [folder("bills", [folder("phone")]), folder("work")];
+    const rules = [
+      { actions: [{ type: "MOVE_FOLDER", folderId: "phone" }] },
+      {
+        actions: [
+          { type: "MOVE_FOLDER", folderId: "bills" },
+          { type: "MOVE_FOLDER", folderId: "phone" },
+        ],
+      },
+      { actions: [{ type: "MOVE_FOLDER", folderId: "work" }] },
+      { actions: [{ type: "LABEL", folderId: null }] },
+    ];
+
+    expect(countRulesFilingInto(tree, "bills", rules)).toBe(2);
+    expect(countRulesFilingInto(tree, "phone", rules)).toBe(2);
+    expect(countRulesFilingInto(tree, "missing", rules)).toBe(0);
   });
 });

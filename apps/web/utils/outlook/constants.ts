@@ -7,6 +7,7 @@ export const WELL_KNOWN_FOLDERS = {
   archive: "archive",
   deleteditems: "deleteditems",
   junkemail: "junkemail",
+  outbox: "outbox",
 } as const;
 
 export const OutlookLabel = {

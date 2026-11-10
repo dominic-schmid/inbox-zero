@@ -1,6 +1,12 @@
 "use client";
 
-import { type FormEvent, type ReactNode, useEffect, useState } from "react";
+import {
+  type DragEvent,
+  type FormEvent,
+  type ReactNode,
+  useEffect,
+  useState,
+} from "react";
 import Link from "next/link";
 import { getMailSidebarRowPresentation } from "@inboxzero/mail-ui/MailSidebarRow";
 import {
@@ -42,11 +48,27 @@ import { getShortcutHint } from "@/lib/shortcuts/registry";
 import type { EmailLabel } from "@/providers/email-label-types";
 import { GmailLabel } from "@/utils/gmail/label";
 import { cn } from "@/utils";
-import type { OutlookFolder } from "@/utils/outlook/folders";
+import {
+  getOutlookFolderMoveProblem,
+  type OutlookFolder,
+} from "@/utils/outlook/folders";
 import { OUTLOOK_INBOX_SECTIONS } from "@/utils/outlook/inbox-sections";
 import { getLabelTree, type SidebarLabel } from "./label-tree";
 import { splitLabelsByListVisibility } from "./label-visibility";
-import { getMailSidebarFolders } from "./outlook-folder-list";
+import {
+  countRulesFilingInto,
+  getFolderPath,
+  getMailSidebarFolders,
+  getParentFolder,
+} from "./outlook-folder-list";
+import { CreateFolderDialog } from "@/components/CreateFolderDialog";
+import { useRules } from "@/hooks/useRules";
+import { type FolderMove, MoveFolderDialog } from "./MoveFolderDialog";
+import {
+  type FolderRuleCount,
+  FolderRuleCountNotice,
+} from "./FolderRuleCountNotice";
+
 import {
   MailboxItemContextMenu,
   type MailboxItemColorOption,
@@ -89,6 +111,10 @@ export type MailSidebarProps = {
   labelKeys?: ReadonlyMap<string, string>;
   onEditMailboxItem: (edit: MailboxItemEdit) => Promise<boolean>;
   onDeleteMailboxItem: (item: MailboxItem) => Promise<boolean>;
+  /** Without a destination the folder moves to the top level. */
+  onMoveFolder: (folderId: string, destinationId?: string) => Promise<boolean>;
+  /** Reloads the folder list after a folder is created. */
+  onFoldersChanged: () => void;
   labelEditMode: "color" | "name-and-color";
   labelColorOptions: readonly MailboxItemColorOption[];
   /** Gmail lets a label be hidden from the label and message lists. */
@@ -191,6 +217,8 @@ export function MailSidebar({
   labelKeys,
   onEditMailboxItem,
   onDeleteMailboxItem,
+  onMoveFolder,
+  onFoldersChanged,
   labelEditMode,
   labelColorOptions,
   supportsLabelVisibility = false,
@@ -204,6 +232,64 @@ export function MailSidebar({
   const [isAddingLabel, setIsAddingLabel] = useState(false);
   const [newLabelName, setNewLabelName] = useState("");
   const sidebarFolders = getMailSidebarFolders(folders);
+  // null while closed; an empty object creates a top-level folder.
+  const [newFolder, setNewFolder] = useState<{
+    parent?: { id: string; path: string };
+  } | null>(null);
+  const [folderToMove, setFolderToMove] = useState<FolderMove | null>(null);
+  // Moving a folder that rules file into, or before the rules are known, is
+  // confirmed in the dialog, which explains what happens to those rules.
+  const { data: rules, error: rulesError } = useRules(
+    emailAccountId,
+    !unified && folders.length > 0,
+  );
+  const folderRuleCount = (folderId: string): FolderRuleCount => {
+    if (rules) return countRulesFilingInto(folders, folderId, rules);
+    return rulesError ? "unknown" : "loading";
+  };
+  const canMoveFolder = (folderId: string, destinationId?: string) =>
+    !getOutlookFolderMoveProblem(folders, folderId, destinationId);
+  const [draggedFolderId, setDraggedFolderId] = useState<string | null>(null);
+  // "top-level" is the Folders heading; null is no drop target.
+  const [folderDropTarget, setFolderDropTarget] = useState<string | null>(null);
+  const canDropFolder = (destinationId?: string) =>
+    !!draggedFolderId && canMoveFolder(draggedFolderId, destinationId);
+  const folderDropHandlers = (destinationId?: string) => ({
+    onDragOver: (event: DragEvent) => {
+      if (!canDropFolder(destinationId)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      setFolderDropTarget(destinationId ?? "top-level");
+    },
+    onDragLeave: (event: DragEvent) => {
+      if (event.currentTarget.contains(event.relatedTarget as Node | null))
+        return;
+      setFolderDropTarget(null);
+    },
+    onDrop: (event: DragEvent) => {
+      event.preventDefault();
+      const folderId = draggedFolderId;
+      setDraggedFolderId(null);
+      setFolderDropTarget(null);
+      if (!folderId || !canMoveFolder(folderId, destinationId)) return;
+      if (folderRuleCount(folderId) === 0) {
+        onMoveFolder(folderId, destinationId);
+        return;
+      }
+      const folder = sidebarFolders.find((f) => f.id === folderId);
+      const destinationPath = destinationId
+        ? getFolderPath(folders, destinationId)
+        : undefined;
+      setFolderToMove({
+        id: folderId,
+        name: folder?.displayName ?? "folder",
+        destination:
+          destinationId && destinationPath
+            ? { id: destinationId, path: destinationPath }
+            : undefined,
+      });
+    },
+  });
   const { visibleLabels, hiddenLabels } = splitLabelsByListVisibility({
     labels,
     countsById,
@@ -404,46 +490,136 @@ export function MailSidebar({
             </>
           )}
 
-        {!unified && sidebarFolders.length > 0 && (
-          <>
-            <GroupHeading collapsed={collapsed}>Folders</GroupHeading>
-            <nav className="flex flex-col gap-px">
-              {sidebarFolders.map((folder) => (
-                <MailboxItemContextMenu
-                  key={folder.id}
-                  item={{
-                    kind: "folder",
-                    id: folder.id,
-                    name: folder.displayName,
-                  }}
-                  typeName="folder"
-                  editMode="name"
-                  onEdit={onEditMailboxItem}
-                  onDelete={onDeleteMailboxItem}
+        {/* Expanded, the heading stays so a first folder can be created. */}
+        {!unified &&
+          folders.length > 0 &&
+          (!collapsed || sidebarFolders.length > 0) && (
+            <>
+              <div
+                {...(collapsed ? {} : folderDropHandlers())}
+                className={cn(
+                  "rounded-md",
+                  folderDropTarget === "top-level" && "bg-accent",
+                )}
+              >
+                <GroupHeading
+                  collapsed={collapsed}
+                  action={
+                    <button
+                      type="button"
+                      onClick={() => setNewFolder({})}
+                      aria-label="Create folder"
+                      className="rounded-md p-0.5 text-muted-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <PlusIcon className="size-3.5" />
+                    </button>
+                  }
                 >
-                  <NavRow
-                    href={hrefFor({ kind: "folder", folderId: folder.id })}
-                    onNavigate={onNavigate}
-                    active={activeFolderId === folder.id}
-                    icon={
-                      <FolderIcon
-                        className="size-3.5 shrink-0"
-                        style={
-                          collapsed
-                            ? undefined
-                            : { marginLeft: folder.depth * 12 }
+                  {draggedFolderId ? "Drop here for top level" : "Folders"}
+                </GroupHeading>
+              </div>
+              <nav className="flex flex-col gap-px">
+                {sidebarFolders.map((folder) => (
+                  <MailboxItemContextMenu
+                    key={folder.id}
+                    item={{
+                      kind: "folder",
+                      id: folder.id,
+                      name: folder.displayName,
+                    }}
+                    typeName="folder"
+                    editMode="name"
+                    folderActions={{
+                      onCreateSubfolder: () =>
+                        setNewFolder({
+                          parent: {
+                            id: folder.id,
+                            path:
+                              getFolderPath(folders, folder.id) ??
+                              folder.displayName,
+                          },
+                        }),
+                      onMove: () =>
+                        setFolderToMove({
+                          id: folder.id,
+                          name: folder.displayName,
+                          destination: getParentFolder(folders, folder.id),
+                        }),
+                      renameNotice: (
+                        <FolderRuleCountNotice
+                          ruleCount={folderRuleCount(folder.id)}
+                          change="rename"
+                        />
+                      ),
+                    }}
+                    onEdit={onEditMailboxItem}
+                    onDelete={onDeleteMailboxItem}
+                  >
+                    <div
+                      {...(collapsed
+                        ? {}
+                        : {
+                            draggable: true,
+                            onDragStart: (event: DragEvent) => {
+                              event.dataTransfer.effectAllowed = "move";
+                              setDraggedFolderId(folder.id);
+                            },
+                            onDragEnd: () => {
+                              setDraggedFolderId(null);
+                              setFolderDropTarget(null);
+                            },
+                            ...folderDropHandlers(folder.id),
+                          })}
+                      className={cn(
+                        "rounded-md",
+                        folderDropTarget === folder.id &&
+                          "ring-2 ring-primary ring-inset",
+                        draggedFolderId === folder.id && "opacity-50",
+                      )}
+                    >
+                      <NavRow
+                        href={hrefFor({ kind: "folder", folderId: folder.id })}
+                        onNavigate={onNavigate}
+                        active={activeFolderId === folder.id}
+                        icon={
+                          <FolderIcon
+                            className="size-3.5 shrink-0"
+                            style={
+                              collapsed
+                                ? undefined
+                                : { marginLeft: folder.depth * 12 }
+                            }
+                          />
                         }
+                        name={folder.displayName}
+                        count={displayCount(countsById.get(folder.id))}
+                        collapsed={collapsed}
                       />
-                    }
-                    name={folder.displayName}
-                    count={displayCount(countsById.get(folder.id))}
-                    collapsed={collapsed}
-                  />
-                </MailboxItemContextMenu>
-              ))}
-            </nav>
-          </>
-        )}
+                    </div>
+                  </MailboxItemContextMenu>
+                ))}
+              </nav>
+              <CreateFolderDialog
+                open={!!newFolder}
+                onOpenChange={(open) => {
+                  if (!open) setNewFolder(null);
+                }}
+                emailAccountId={emailAccountId}
+                folders={folders}
+                parent={newFolder?.parent}
+                onCreated={onFoldersChanged}
+              />
+              <MoveFolderDialog
+                folder={folderToMove}
+                folders={folders}
+                ruleCount={folderToMove ? folderRuleCount(folderToMove.id) : 0}
+                onOpenChange={(open) => {
+                  if (!open) setFolderToMove(null);
+                }}
+                onMove={onMoveFolder}
+              />
+            </>
+          )}
 
         {!unified && (!collapsed || (showLabels && labelTree.length > 0)) ? (
           <>

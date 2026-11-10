@@ -14,6 +14,14 @@ export function isAlreadyExistsError(error: unknown): boolean {
   );
 }
 
+/** Graph refuses a folder name that a sibling already has (case-insensitively). */
+export function isFolderExistsError(error: unknown): boolean {
+  const graphError = error as { code?: string; statusCode?: number } | null;
+  return (
+    graphError?.code === "ErrorFolderExists" || graphError?.statusCode === 409
+  );
+}
+
 /**
  * Check if a Microsoft Graph API error indicates a resource was not found.
  * GraphError from the SDK has `statusCode: number` as the canonical HTTP status.
