@@ -216,6 +216,10 @@ export async function getOrCreateOutlookFolderIdByName(
   folderName: string,
   logger: Logger,
 ): Promise<string> {
+  if (folderName.includes("/")) {
+    return getOrCreateOutlookFolderPath(client, folderName, logger);
+  }
+
   const existingFolder = await findOutlookFolderByName(
     client,
     folderName,
@@ -238,15 +242,13 @@ export async function getOrCreateOutlookFolderIdByName(
     return response.id;
   } catch (error) {
     // The folder can appear between the lookup and the create, or the lookup itself can fail.
-    // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
-    const err = error as any;
-    if (err?.code === "ErrorFolderExists" || err?.statusCode === 409) {
+    if (isOutlookFolderExistsError(error)) {
       logger.info("Folder already exists, fetching existing folder", {
         folderName,
       });
       const folder =
         (await findOutlookFolderByName(client, folderName, logger)) ??
-        (await findRootOutlookFolderByListing(client, folderName, logger).catch(
+        (await findOutlookFolderAmongSiblings(client, folderName, logger).catch(
           (listingError) => {
             logger.warn("Error listing folders to find existing folder", {
               folderName,
@@ -310,12 +312,14 @@ export function flattenOutlookFolders(
 }
 
 // Outlook folder names are unique case-insensitively among siblings.
-async function findRootOutlookFolderByListing(
+async function findOutlookFolderAmongSiblings(
   client: OutlookClient,
   folderName: string,
   logger: Logger,
+  parentId?: string,
 ): Promise<OutlookFolder | undefined> {
   const normalizedName = folderName.toLowerCase();
+  const collectionPath = outlookFolderCollectionPath(parentId);
   let nextLink: string | undefined;
   do {
     const link = nextLink;
@@ -326,7 +330,7 @@ async function findRootOutlookFolderByListing(
             ? client.getClient().api(link).get()
             : client
                 .getClient()
-                .api("/me/mailFolders")
+                .api(collectionPath)
                 .select("id,displayName")
                 .top(999)
                 .get(),
@@ -339,4 +343,102 @@ async function findRootOutlookFolderByListing(
     nextLink =
       resolveMicrosoftGraphNextLink(response["@odata.nextLink"]) ?? undefined;
   } while (nextLink);
+}
+
+async function getOrCreateOutlookFolderPath(
+  client: OutlookClient,
+  folderName: string,
+  logger: Logger,
+): Promise<string> {
+  const [rootSegment, ...childSegments] = folderName
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+
+  if (!rootSegment) {
+    throw new Error("Outlook folder path is empty");
+  }
+
+  if (childSegments.length === 0) {
+    return getOrCreateOutlookFolderIdByName(client, rootSegment, logger);
+  }
+
+  let parentId = await getOrCreateOutlookFolderUnderParent(
+    client,
+    undefined,
+    rootSegment,
+    logger,
+  );
+  for (const segment of childSegments) {
+    parentId = await getOrCreateOutlookFolderUnderParent(
+      client,
+      parentId,
+      segment,
+      logger,
+    );
+  }
+  return parentId;
+}
+
+async function getOrCreateOutlookFolderUnderParent(
+  client: OutlookClient,
+  parentId: string | undefined,
+  folderName: string,
+  logger: Logger,
+): Promise<string> {
+  const existing = await findOutlookFolderAmongSiblings(
+    client,
+    folderName,
+    logger,
+    parentId,
+  ).catch((error) => {
+    logger.warn("Error finding folder by name", { folderName, error });
+    return;
+  });
+  if (existing) return existing.id;
+
+  try {
+    const response = await withMicrosoftGraphWriteRetry(
+      () =>
+        client
+          .getClient()
+          .api(outlookFolderCollectionPath(parentId))
+          .post({ displayName: folderName }),
+      logger,
+    );
+    return response.id;
+  } catch (error) {
+    if (isOutlookFolderExistsError(error)) {
+      logger.info("Folder already exists, fetching existing folder", {
+        folderName,
+      });
+      const folder = await findOutlookFolderAmongSiblings(
+        client,
+        folderName,
+        logger,
+        parentId,
+      ).catch((listingError) => {
+        logger.warn("Error listing folders to find existing folder", {
+          folderName,
+          error: listingError,
+        });
+        return;
+      });
+      if (folder) return folder.id;
+    }
+    throw error;
+  }
+}
+
+function outlookFolderCollectionPath(parentId?: string): string {
+  if (!parentId) return "/me/mailFolders";
+  return `/me/mailFolders/${encodeURIComponent(parentId)}/childFolders`;
+}
+
+function isOutlookFolderExistsError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const graphError = error as { code?: unknown; statusCode?: unknown };
+  return (
+    graphError.code === "ErrorFolderExists" || graphError.statusCode === 409
+  );
 }

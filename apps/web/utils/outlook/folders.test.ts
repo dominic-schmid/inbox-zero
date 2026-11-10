@@ -52,7 +52,7 @@ describe("getOrCreateOutlookFolderIdByName", () => {
   it.each([
     "Bills & Receipts",
     "Partner's Invoices",
-    "Ticket #42 + 50% / Q?",
+    "Ticket #42 + 50% Q?",
     "Reçus & Factures",
   ])("finds the existing folder %s without breaking the Graph URL", async (name) => {
     const { client, requests } = createGraphClient((request) =>
@@ -112,6 +112,164 @@ describe("getOrCreateOutlookFolderIdByName", () => {
   });
 });
 
+describe("getOrCreateOutlookFolderIdByName nested paths", () => {
+  it("creates the root and child when both are missing", async () => {
+    const posts: Array<{ pathname: string; body: unknown }> = [];
+    const { client } = createGraphClient(async (request) => {
+      const url = new URL(request.url);
+      if (request.method === "POST") {
+        const body = await request.json();
+        posts.push({ pathname: url.pathname, body });
+        const parentId = childFolderParentId(url.pathname);
+        return Response.json({
+          id: parentId ? "phone-id" : "bills-id",
+          displayName: body.displayName,
+        });
+      }
+      return Response.json({ value: [] });
+    });
+
+    const id = await getOrCreateOutlookFolderIdByName(
+      client,
+      "/ Bills // Phone /",
+      logger,
+    );
+
+    expect(id).toBe("phone-id");
+    expect(posts).toEqual([
+      { pathname: "/v1.0/me/mailFolders", body: { displayName: "Bills" } },
+      {
+        pathname: "/v1.0/me/mailFolders/bills-id/childFolders",
+        body: { displayName: "Phone" },
+      },
+    ]);
+  });
+
+  it.each([
+    "bills/phone",
+    "/Bills/Phone/",
+    "Bills//Phone",
+    " Bills / phone ",
+  ])("reuses existing folders for %s", async (folderName) => {
+    const { client, requests } = createGraphClient((request) => {
+      const url = new URL(request.url);
+      if (url.pathname.includes("/childFolders")) {
+        return Response.json({
+          value: [
+            { id: "other-id", displayName: "Internet" },
+            { id: "phone-id", displayName: "Phone" },
+          ],
+        });
+      }
+      return Response.json({
+        value: [
+          { id: "inbox-id", displayName: "Inbox" },
+          { id: "bills-id", displayName: "Bills" },
+        ],
+      });
+    });
+
+    const id = await getOrCreateOutlookFolderIdByName(
+      client,
+      folderName,
+      logger,
+    );
+
+    expect(id).toBe("phone-id");
+    expect(requests.some((request) => request.method === "POST")).toBe(false);
+  });
+
+  it("handles a 409 race on a child", async () => {
+    let childLookups = 0;
+    const { client, requests } = createGraphClient((request) => {
+      const url = new URL(request.url);
+      if (request.method === "POST") {
+        return Response.json(
+          { error: { code: "ErrorFolderExists", message: "exists" } },
+          { status: 409 },
+        );
+      }
+      if (url.pathname.includes("/childFolders")) {
+        childLookups += 1;
+        if (childLookups === 1) return Response.json({ value: [] });
+        return Response.json({
+          value: [{ id: "phone-id", displayName: "Phone" }],
+        });
+      }
+      return Response.json({
+        value: [{ id: "bills-id", displayName: "Bills" }],
+      });
+    });
+
+    const id = await getOrCreateOutlookFolderIdByName(
+      client,
+      "Bills/Phone",
+      logger,
+    );
+
+    expect(id).toBe("phone-id");
+    expect(
+      requests
+        .filter((request) => request.method === "POST")
+        .map((request) => new URL(request.url).pathname),
+    ).toEqual(["/v1.0/me/mailFolders/bills-id/childFolders"]);
+  });
+
+  it("keeps a single-segment name on the root folder lookup", async () => {
+    const { client, requests } = createGraphClient((request) =>
+      request.method === "GET"
+        ? Response.json({
+            value: [{ id: "existing-id", displayName: "Bills" }],
+          })
+        : Response.json({ id: "created-id", displayName: "Bills" }),
+    );
+
+    const id = await getOrCreateOutlookFolderIdByName(client, "Bills", logger);
+
+    expect(id).toBe("existing-id");
+    expect(requests).toHaveLength(1);
+    const url = new URL(requests[0].url);
+    expect(url.pathname).toBe("/v1.0/me/mailFolders");
+    expect(url.searchParams.get("$filter")).toBe("displayName eq 'Bills'");
+    expect(
+      requests.some((request) => request.url.includes("childFolders")),
+    ).toBe(false);
+  });
+
+  it("looks up a one-segment path as that root folder", async () => {
+    const { client, requests } = createGraphClient(() =>
+      Response.json({ value: [{ id: "bills-id", displayName: "Bills" }] }),
+    );
+
+    const id = await getOrCreateOutlookFolderIdByName(
+      client,
+      "/Bills/",
+      logger,
+    );
+
+    expect(id).toBe("bills-id");
+    expect(requests).toHaveLength(1);
+    expect(new URL(requests[0].url).searchParams.get("$filter")).toBe(
+      "displayName eq 'Bills'",
+    );
+  });
+
+  it.each([
+    "/",
+    "///",
+    " / ",
+  ])("does not create a folder when %s has no names", async (folderName) => {
+    const { client, requests } = createGraphClient(() =>
+      Response.json({ value: [] }),
+    );
+
+    await expect(
+      getOrCreateOutlookFolderIdByName(client, folderName, logger),
+    ).rejects.toThrow("Outlook folder path is empty");
+    expect(requests).toHaveLength(0);
+  });
+});
+
 describe("getOrCreateOutlookFolderIdByName conflict recovery", () => {
   it("rethrows the original conflict when the fallback listing fails", async () => {
     const { client } = createGraphClient((request) => {
@@ -136,7 +294,9 @@ describe("getOrCreateOutlookFolderIdByName conflict recovery", () => {
   });
 });
 
-function createGraphClient(handler: (request: Request) => Response) {
+function createGraphClient(
+  handler: (request: Request) => Response | Promise<Response>,
+) {
   const requests: Request[] = [];
   const graph = Client.initWithMiddleware({
     middleware: {
@@ -146,12 +306,17 @@ function createGraphClient(handler: (request: Request) => Response) {
           context.options as RequestInit,
         );
         requests.push(request);
-        context.response = handler(request);
+        context.response = await handler(request);
       },
     },
   });
   const client = { getClient: () => graph } as unknown as OutlookClient;
   return { client, requests };
+}
+
+function childFolderParentId(pathname: string): string | undefined {
+  const match = pathname.match(/\/mailFolders\/([^/]+)\/childFolders$/);
+  return match ? decodeURIComponent(match[1]) : undefined;
 }
 
 function createMockClient(
