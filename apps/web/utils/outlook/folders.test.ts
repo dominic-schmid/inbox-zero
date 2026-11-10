@@ -113,7 +113,13 @@ describe("getOrCreateOutlookFolderIdByName", () => {
 });
 
 describe("getOrCreateOutlookFolderIdByName nested paths", () => {
-  it("creates the root and child when both are missing", async () => {
+  it.each([
+    "/ Bills // Phone /",
+    "Bills/Phone/",
+    "/Bills/Phone",
+    "Bills//Phone",
+    "Bills/Phone//",
+  ])("creates Phone under Bills for %s", async (folderName) => {
     const posts: Array<{ pathname: string; body: unknown }> = [];
     const { client } = createGraphClient(async (request) => {
       const url = new URL(request.url);
@@ -131,7 +137,7 @@ describe("getOrCreateOutlookFolderIdByName nested paths", () => {
 
     const id = await getOrCreateOutlookFolderIdByName(
       client,
-      "/ Bills // Phone /",
+      folderName,
       logger,
     );
 
