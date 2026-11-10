@@ -99,6 +99,7 @@ export function ActionSteps({
   typeOptions,
   folders,
   foldersLoading,
+  onFoldersChanged,
   messagingChannels,
   availableMessagingProviders,
   append,
@@ -125,6 +126,7 @@ export function ActionSteps({
   }[];
   folders: OutlookFolder[];
   foldersLoading: boolean;
+  onFoldersChanged: () => void;
   messagingChannels: MessagingChannelOption[];
   availableMessagingProviders: MessagingProviderOption[];
   append: (action: CreateRuleBody["actions"][number]) => void;
@@ -162,6 +164,7 @@ export function ActionSteps({
           typeOptions={typeOptions}
           folders={folders}
           foldersLoading={foldersLoading}
+          onFoldersChanged={onFoldersChanged}
           messagingChannels={messagingChannels}
           availableMessagingProviders={availableMessagingProviders}
           attachmentSources={attachmentSources}
@@ -189,6 +192,7 @@ function ActionCard({
   typeOptions,
   folders,
   foldersLoading,
+  onFoldersChanged,
   messagingChannels,
   availableMessagingProviders,
   attachmentSources,
@@ -215,6 +219,7 @@ function ActionCard({
   }[];
   folders: OutlookFolder[];
   foldersLoading: boolean;
+  onFoldersChanged: () => void;
   messagingChannels: MessagingChannelOption[];
   availableMessagingProviders: MessagingProviderOption[];
   attachmentSources: AttachmentSourceInput[];
@@ -489,6 +494,10 @@ function ActionCard({
               <FolderSelector
                 folders={folders}
                 isLoading={foldersLoading}
+                createFolder={{
+                  emailAccountId,
+                  onCreated: onFoldersChanged,
+                }}
                 value={{
                   name: watch(`actions.${index}.folderName.value`) || "",
                   id: watch(`actions.${index}.folderId.value`) || "",

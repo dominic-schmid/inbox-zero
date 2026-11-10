@@ -54,6 +54,8 @@ vi.mock("@/utils/actions/all-accounts", () => ({
 }));
 
 vi.mock("@/utils/user", () => ({ logOut: vi.fn() }));
+// MailSidebar (for RailTooltip) reaches the folder server actions.
+vi.mock("@/utils/actions/mail", () => ({ createFolderAction: vi.fn() }));
 
 vi.mock("./AllAccountsSelectionDialog", () => ({
   AllAccountsSelectionDialog: () => null,

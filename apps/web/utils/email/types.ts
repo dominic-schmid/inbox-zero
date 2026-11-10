@@ -238,6 +238,7 @@ export interface EmailProvider {
     addLabelIds?: string[];
     removeLabelIds?: string[];
   }): Promise<{ status: number }>;
+  createFolder(name: string, parentId?: string): Promise<OutlookFolder>;
   createLabel(name: string, description?: string): Promise<EmailLabel>;
   deleteDraft(draftId: string, version?: string): Promise<boolean>;
   deleteFilter(id: string): Promise<{ status: number }>;
@@ -425,6 +426,8 @@ export interface EmailProvider {
   markRead(threadId: string): Promise<void>;
   markReadThread(threadId: string, read: boolean): Promise<void>;
   markSpam(threadId: string): Promise<void>;
+  /** Without a destination the folder moves to the top level. */
+  moveFolder(folderId: string, destinationId?: string): Promise<void>;
   moveThreadToFolder(
     threadId: string,
     ownerEmail: string,

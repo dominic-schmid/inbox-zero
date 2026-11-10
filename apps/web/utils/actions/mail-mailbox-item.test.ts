@@ -2,7 +2,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getMockEmailAccountWithAccount } from "@/__tests__/helpers";
 import prisma from "@/utils/__mocks__/prisma";
 import {
+  createFolderAction,
   deleteMailboxItemAction,
+  moveFolderAction,
   updateMailboxItemAction,
 } from "@/utils/actions/mail";
 
@@ -15,12 +17,18 @@ vi.mock("@/utils/auth", () => ({
 
 const {
   mockCreateEmailProvider,
+  mockCreateFolder,
+  mockGetFolders,
+  mockMoveFolder,
   mockDeleteFolder,
   mockDeleteLabel,
   mockRenameFolder,
   mockUpdateLabel,
 } = vi.hoisted(() => ({
   mockCreateEmailProvider: vi.fn(),
+  mockCreateFolder: vi.fn(),
+  mockGetFolders: vi.fn(),
+  mockMoveFolder: vi.fn(),
   mockDeleteFolder: vi.fn(),
   mockDeleteLabel: vi.fn(),
   mockRenameFolder: vi.fn(),
@@ -37,6 +45,8 @@ const EMAIL_ACCOUNT_ID = "email-account-1";
 describe("mailbox item actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetFolders.mockResolvedValue(FOLDER_TREE);
+    prisma.action.findMany.mockResolvedValue([]);
     prisma.emailAccount.findUnique.mockResolvedValue(
       getMockEmailAccountWithAccount({
         email: "user@example.com",
@@ -45,6 +55,9 @@ describe("mailbox item actions", () => {
       }),
     );
     mockCreateEmailProvider.mockResolvedValue({
+      createFolder: mockCreateFolder,
+      getFolders: mockGetFolders,
+      moveFolder: mockMoveFolder,
       deleteFolder: mockDeleteFolder,
       deleteLabel: mockDeleteLabel,
       renameFolder: mockRenameFolder,
@@ -194,6 +207,199 @@ describe("mailbox item actions", () => {
     );
     expect(mockDeleteFolder).not.toHaveBeenCalled();
   });
+
+  it("creates an Outlook subfolder with its name taken literally", async () => {
+    setProvider("microsoft");
+    mockCreateFolder.mockResolvedValue({
+      id: "new-id",
+      displayName: "Receipts/2024",
+      childFolders: [],
+    });
+
+    const result = await createFolderAction(EMAIL_ACCOUNT_ID, {
+      name: " Receipts/2024 ",
+      parentId: "bills-id",
+    });
+
+    expect(result?.data?.id).toBe("new-id");
+    expect(mockCreateFolder).toHaveBeenCalledWith("Receipts/2024", "bills-id");
+  });
+
+  it("moves an Outlook folder to the top level when no destination is given", async () => {
+    setProvider("microsoft");
+
+    const result = await moveFolderAction(EMAIL_ACCOUNT_ID, { id: "phone-id" });
+
+    expect(result?.serverError).toBeUndefined();
+    expect(mockMoveFolder).toHaveBeenCalledWith("phone-id", undefined);
+  });
+
+  it("refuses to move a folder into one of its own subfolders", async () => {
+    setProvider("microsoft");
+
+    const result = await moveFolderAction(EMAIL_ACCOUNT_ID, {
+      id: "bills-id",
+      destinationId: "phone-id",
+    });
+
+    expect(result?.serverError).toBe(
+      "A folder can't be moved into itself or one of its subfolders.",
+    );
+    expect(mockMoveFolder).not.toHaveBeenCalled();
+  });
+
+  it("refuses to move a folder into Deleted Items", async () => {
+    setProvider("microsoft");
+
+    const result = await moveFolderAction(EMAIL_ACCOUNT_ID, {
+      id: "phone-id",
+      destinationId: "trash-id",
+    });
+
+    expect(result?.serverError).toBe("Folders can't be moved there.");
+    expect(mockMoveFolder).not.toHaveBeenCalled();
+  });
+
+  it("reports a name clash only when Outlook says the folder exists", async () => {
+    setProvider("microsoft");
+    mockMoveFolder.mockRejectedValueOnce(
+      Object.assign(new Error("exists"), { code: "ErrorFolderExists" }),
+    );
+    mockMoveFolder.mockRejectedValueOnce(new Error("timeout"));
+
+    const clash = await moveFolderAction(EMAIL_ACCOUNT_ID, {
+      id: "phone-id",
+      destinationId: "work-id",
+    });
+    const other = await moveFolderAction(EMAIL_ACCOUNT_ID, {
+      id: "phone-id",
+      destinationId: "work-id",
+    });
+
+    expect(clash?.serverError).toBe(
+      "A folder with that name already exists there.",
+    );
+    expect(other?.serverError).toBe("Failed to move folder. Please try again.");
+  });
+
+  it("updates the stored paths of rules filing into the moved folder", async () => {
+    setProvider("microsoft");
+    prisma.action.findMany.mockResolvedValue([
+      { id: "action-1", folderId: "phone-id", folderName: "Bills ⦙ Phone" },
+    ] as any);
+
+    await moveFolderAction(EMAIL_ACCOUNT_ID, {
+      id: "bills-id",
+      destinationId: "work-id",
+    });
+
+    expect(prisma.action.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          folderId: { in: ["bills-id", "phone-id"] },
+        }),
+      }),
+    );
+    expect(prisma.action.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "action-1",
+        emailAccountId: EMAIL_ACCOUNT_ID,
+        folderId: "phone-id",
+      },
+      data: { folderName: "Work ⦙ Bills ⦙ Phone" },
+    });
+  });
+
+  it("updates the stored paths of rules filing below a renamed folder", async () => {
+    setProvider("microsoft");
+    prisma.action.findMany.mockResolvedValue([
+      { id: "action-1", folderId: "phone-id", folderName: "Bills ⦙ Phone" },
+    ] as any);
+
+    await updateMailboxItemAction(EMAIL_ACCOUNT_ID, {
+      kind: "folder",
+      id: "bills-id",
+      name: "Invoices",
+    });
+
+    expect(prisma.action.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { folderName: "Invoices ⦙ Phone" } }),
+    );
+  });
+
+  it("leaves rules filing into a folder in Deleted Items alone", async () => {
+    setProvider("microsoft");
+
+    await updateMailboxItemAction(EMAIL_ACCOUNT_ID, {
+      kind: "folder",
+      id: "trashed-id",
+      name: "Older",
+    });
+
+    expect(mockRenameFolder).toHaveBeenCalledWith("trashed-id", "Older");
+    expect(prisma.action.findMany).not.toHaveBeenCalled();
+  });
+
+  it("refuses to create a folder inside Deleted Items", async () => {
+    setProvider("microsoft");
+
+    const result = await createFolderAction(EMAIL_ACCOUNT_ID, {
+      name: "Receipts",
+      parentId: "trashed-id",
+    });
+
+    expect(result?.serverError).toBe("Folders can't be created there.");
+    expect(mockCreateFolder).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a system folder", "trash-id", "work-id", "That folder can't be moved."],
+    [
+      "a folder in Deleted Items",
+      "trashed-id",
+      undefined,
+      "That folder can't be moved.",
+    ],
+    [
+      "a folder to where it already is",
+      "phone-id",
+      "bills-id",
+      "The folder is already there.",
+    ],
+  ])("refuses to move %s", async (_case, id, destinationId, message) => {
+    setProvider("microsoft");
+
+    const result = await moveFolderAction(EMAIL_ACCOUNT_ID, {
+      id,
+      destinationId,
+    });
+
+    expect(result?.serverError).toBe(message);
+    expect(mockMoveFolder).not.toHaveBeenCalled();
+  });
+
+  it("refuses folder names that would read as a path", async () => {
+    setProvider("microsoft");
+
+    const result = await createFolderAction(EMAIL_ACCOUNT_ID, {
+      name: "Bills ⦙ Phone",
+    });
+
+    expect(result?.validationErrors).toBeDefined();
+    expect(mockCreateFolder).not.toHaveBeenCalled();
+  });
+
+  it("rejects moving a folder into itself", async () => {
+    setProvider("microsoft");
+
+    const result = await moveFolderAction(EMAIL_ACCOUNT_ID, {
+      id: "phone-id",
+      destinationId: "phone-id",
+    });
+
+    expect(result?.validationErrors).toBeDefined();
+    expect(mockMoveFolder).not.toHaveBeenCalled();
+  });
 });
 
 function setProvider(provider: "google" | "microsoft") {
@@ -204,4 +410,28 @@ function setProvider(provider: "google" | "microsoft") {
       provider,
     }),
   );
+}
+
+const FOLDER_TREE = [
+  outlookFolder("bills-id", "Bills", [outlookFolder("phone-id", "Phone")]),
+  outlookFolder("work-id", "Work"),
+  {
+    ...outlookFolder("trash-id", "Deleted Items", [
+      outlookFolder("trashed-id", "Old"),
+    ]),
+    systemType: "TRASH" as const,
+  },
+];
+
+function outlookFolder(
+  id: string,
+  displayName: string,
+  childFolders: ReturnType<typeof outlookFolder>[] = [],
+): {
+  id: string;
+  displayName: string;
+  childFolders: ReturnType<typeof outlookFolder>[];
+  systemType?: "TRASH";
+} {
+  return { id, displayName, childFolders };
 }

@@ -28,6 +28,7 @@ import {
   MAIL_SIDEBAR_WIDTH_BOUNDS,
   MAIL_SIDEBAR_WIDTH_COOKIE,
 } from "@/app/(app)/[emailAccountId]/mail/panel-widths";
+import { moveFolderInTree } from "@/app/(app)/[emailAccountId]/mail/outlook-folder-list";
 import { PanelResizeHandle } from "@/components/PanelResizeHandle";
 import { DesktopUpdateMenuItem } from "@/components/DesktopUpdateMenuItem";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
@@ -40,11 +41,15 @@ import { useSettingsDialog } from "@/hooks/useSettingsDialog";
 import { useAccount } from "@/providers/EmailAccountProvider";
 import { useComposeModal } from "@/providers/ComposeModalProvider";
 import type { EmailLabel } from "@/providers/email-label-types";
-import type { OutlookFolder } from "@/utils/outlook/folders";
+import {
+  type OutlookFolder,
+  withoutOutlookFolder,
+} from "@/utils/outlook/folders";
 import { persistPanelWidth } from "@/utils/panel-width";
 import {
   createLabelAction,
   deleteMailboxItemAction,
+  moveFolderAction,
   updateMailboxItemAction,
 } from "@/utils/actions/mail";
 import {
@@ -244,7 +249,7 @@ export const MailShellSidebar = memo(function MailShellSidebar({
       const deleted =
         item.kind === "folder"
           ? updateOptimistically(mutateFolders, request, (folders) =>
-              withoutFolder(folders ?? [], item.id),
+              withoutOutlookFolder(folders ?? [], item.id),
             )
           : updateOptimistically(mutateLabels, request, (current) => ({
               labels: (current?.labels ?? []).filter(
@@ -263,6 +268,23 @@ export const MailShellSidebar = memo(function MailShellSidebar({
       resolveLabelId,
     ],
   );
+
+  const onMoveFolder = useCallback(
+    (folderId: string, destinationId?: string) =>
+      updateOptimistically(
+        mutateFolders,
+        async () =>
+          runMailboxItemAction(() =>
+            moveFolderAction(emailAccountId, { id: folderId, destinationId }),
+          ),
+        (folders) => moveFolderInTree(folders ?? [], folderId, destinationId),
+      ),
+    [emailAccountId, mutateFolders],
+  );
+
+  const onFoldersChanged = useCallback(() => {
+    mutateFolders().catch(() => {});
+  }, [mutateFolders]);
 
   // The panel's overlay isn't covered by lg:hidden, so close the panel once
   // the window is wide enough for the rail.
@@ -332,6 +354,8 @@ export const MailShellSidebar = memo(function MailShellSidebar({
       labelKeys={labelKeys}
       onEditMailboxItem={onEditMailboxItem}
       onDeleteMailboxItem={onDeleteMailboxItem}
+      onMoveFolder={onMoveFolder}
+      onFoldersChanged={onFoldersChanged}
       labelEditMode={isOutlook ? "color" : "name-and-color"}
       supportsLabelVisibility={isGoogle}
       labelColorOptions={
@@ -476,16 +500,4 @@ function mapFolders(
       childFolders: mapFolders(folder.childFolders, update),
     }),
   );
-}
-
-function withoutFolder(
-  folders: OutlookFolder[],
-  folderId: string,
-): OutlookFolder[] {
-  return folders
-    .filter((folder) => folder.id !== folderId)
-    .map((folder) => ({
-      ...folder,
-      childFolders: withoutFolder(folder.childFolders, folderId),
-    }));
 }

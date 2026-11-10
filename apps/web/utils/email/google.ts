@@ -2177,6 +2177,14 @@ export class GmailProvider implements EmailProvider {
     return false;
   }
 
+  async createFolder(_name: string, _parentId?: string): Promise<never> {
+    throw new Error("Creating folders is not supported for Gmail");
+  }
+
+  async moveFolder(_folderId: string, _destinationId?: string): Promise<never> {
+    throw new Error("Moving folders is not supported for Gmail");
+  }
+
   async renameFolder(_folderId: string, _name: string): Promise<void> {
     this.logger.warn("Renaming folders is not supported for Gmail");
   }

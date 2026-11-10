@@ -1,6 +1,7 @@
 import { sendEmailBody } from "@/utils/types/mail";
 import { labelVisibility, messageVisibility } from "@/utils/gmail/constants";
 import { z } from "zod";
+import { FOLDER_SEPARATOR_CHARACTER } from "@/utils/outlook/folders";
 
 const mailboxItemKind = z.enum(["label", "folder"]);
 const mailboxItemName = z
@@ -8,6 +9,13 @@ const mailboxItemName = z
   .trim()
   .min(1, "Mailbox item name is required")
   .max(255, "Mailbox item name must be 255 characters or fewer");
+
+// Rule folder names nest on " ⦙ ", so a folder named with it would read as a path.
+const FOLDER_NAME_PATH_CHARACTER_MESSAGE = `Folder names can't contain "${FOLDER_SEPARATOR_CHARACTER}"`;
+const folderName = mailboxItemName.refine(
+  (name) => !name.includes(FOLDER_SEPARATOR_CHARACTER),
+  FOLDER_NAME_PATH_CHARACTER_MESSAGE,
+);
 
 export const unarchiveThreadBody = z.object({ threadId: z.string() });
 export type UnarchiveThreadBody = z.infer<typeof unarchiveThreadBody>;
@@ -50,6 +58,13 @@ export const updateMailboxItemBody = z
         message: "Folder name is required",
       });
     }
+    if (kind === "folder" && name?.includes(FOLDER_SEPARATOR_CHARACTER)) {
+      context.addIssue({
+        code: "custom",
+        path: ["name"],
+        message: FOLDER_NAME_PATH_CHARACTER_MESSAGE,
+      });
+    }
     if (kind === "folder" && color) {
       context.addIssue({
         code: "custom",
@@ -63,6 +78,23 @@ export const updateMailboxItemBody = z
         message: "A label name, color, or visibility setting is required",
       });
     }
+  });
+
+export const createFolderBody = z.object({
+  name: folderName,
+  /** Omitted creates a top-level folder. */
+  parentId: z.string().min(1).optional(),
+});
+
+export const moveFolderBody = z
+  .object({
+    id: z.string().min(1, "Folder ID is required"),
+    /** Omitted moves the folder to the top level. */
+    destinationId: z.string().min(1).optional(),
+  })
+  .refine(({ id, destinationId }) => id !== destinationId, {
+    message: "A folder cannot be moved into itself",
+    path: ["destinationId"],
   });
 
 export const deleteMailboxItemBody = z.object({

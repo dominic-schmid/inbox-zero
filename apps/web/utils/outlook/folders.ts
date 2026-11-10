@@ -6,7 +6,7 @@ import {
   escapeODataString,
 } from "@/utils/outlook/odata-escape";
 import { SafeError } from "@/utils/error";
-import { isNotFoundError } from "@/utils/outlook/errors";
+import { isFolderExistsError, isNotFoundError } from "@/utils/outlook/errors";
 import { resolveMicrosoftGraphNextLink } from "@/utils/outlook/page-token";
 import {
   withMicrosoftGraphRetry,
@@ -19,7 +19,18 @@ export type OutlookSystemFolder =
   | "SENT"
   | "ARCHIVE"
   | "TRASH"
-  | "SPAM";
+  | "SPAM"
+  | "OUTBOX";
+
+// Mail is never filed into these, so they are not offered as places to move
+// or create a folder.
+const NON_FILING_SYSTEM_FOLDERS = new Set<OutlookSystemFolder>([
+  "DRAFT",
+  "SENT",
+  "TRASH",
+  "SPAM",
+  "OUTBOX",
+]);
 
 const OUTLOOK_FOLDER_FIELDS =
   "id,displayName,childFolderCount,totalItemCount,unreadItemCount";
@@ -31,6 +42,9 @@ export const FOLDER_SEPARATOR_CHARACTER = FOLDER_SEPARATOR.trim();
 
 // Outlook allows deeper nesting, but a chain longer than this is not a mailbox.
 const MAX_FOLDER_DEPTH = 32;
+
+// Graph's well-known name for the parent of the top-level folders.
+const MAILBOX_ROOT_FOLDER_ID = "msgfolderroot";
 
 export type OutlookFolder = {
   id: NonNullable<MailFolder["id"]>;
@@ -209,6 +223,7 @@ export function addOutlookSystemFolderTypes(
     [folderIds.archive, "ARCHIVE"],
     [folderIds.deleteditems, "TRASH"],
     [folderIds.junkemail, "SPAM"],
+    [folderIds.outbox, "OUTBOX"],
   ]);
 
   return folders.map((folder) => ({
@@ -241,6 +256,7 @@ export async function getOrCreateOutlookFolderIdByName(
   return parentId!;
 }
 
+/** Outbox is not among the cached well-known folders; it is only needed to label the tree. */
 /**
  * Whether mail can still be filed into a folder known by id: it exists and is
  * not in Deleted Items, where a deleted folder lands with its subfolders.
@@ -293,7 +309,7 @@ export async function isOutlookFolderAvailable(
 }
 
 /** Without a parent the folder is created at the top level of the mailbox. */
-async function createOutlookFolder(
+export async function createOutlookFolder(
   client: OutlookClient,
   { name, parentId }: { name: string; parentId?: string },
   logger: Logger,
@@ -307,6 +323,22 @@ async function createOutlookFolder(
     logger,
   );
   return convertMailFolderToOutlookFolder(folder);
+}
+
+/** Without a destination the folder moves to the top level of the mailbox. */
+export async function moveOutlookFolder(
+  client: OutlookClient,
+  { folderId, destinationId }: { folderId: string; destinationId?: string },
+  logger: Logger,
+): Promise<void> {
+  await withMicrosoftGraphWriteRetry(
+    () =>
+      client
+        .getClient()
+        .api(`/me/mailFolders/${encodeURIComponent(folderId)}/move`)
+        .post({ destinationId: destinationId ?? MAILBOX_ROOT_FOLDER_ID }),
+    logger,
+  );
 }
 
 export async function renameOutlookFolder(
@@ -338,6 +370,89 @@ export async function deleteOutlookFolder(
         .delete(),
     logger,
   );
+}
+
+/** The tree without the system folders mail is never filed into, or their subfolders. */
+export function withoutNonFilingOutlookFolders(
+  folders: OutlookFolder[],
+): OutlookFolder[] {
+  return folders
+    .filter(
+      (folder) =>
+        !folder.systemType || !NON_FILING_SYSTEM_FOLDERS.has(folder.systemType),
+    )
+    .map((folder) => ({
+      ...folder,
+      childFolders: withoutNonFilingOutlookFolders(folder.childFolders ?? []),
+    }));
+}
+
+/** The folder and every folder below it. */
+export function getOutlookFolderSubtree(
+  folders: OutlookFolder[],
+  folderId: string,
+): OutlookFolder[] {
+  for (const folder of folders) {
+    if (folder.id === folderId) return flattenOutlookFolders([folder]);
+    const subtree = getOutlookFolderSubtree(
+      folder.childFolders ?? [],
+      folderId,
+    );
+    if (subtree.length) return subtree;
+  }
+  return [];
+}
+
+/**
+ * Whether mail and folders may be filed into the folder: it exists and is not
+ * in Deleted Items, Junk, Drafts, Sent or Outbox.
+ */
+export function isOutlookFilingTarget(
+  folders: OutlookFolder[],
+  folderId: string,
+): boolean {
+  return (
+    getOutlookFolderSubtree(withoutNonFilingOutlookFolders(folders), folderId)
+      .length > 0
+  );
+}
+
+/**
+ * Why the folder can't be moved there, or null when the move is valid and
+ * changes something. Without a destination the folder moves to the top level.
+ */
+export function getOutlookFolderMoveProblem(
+  folders: OutlookFolder[],
+  folderId: string,
+  destinationId?: string,
+): string | null {
+  const parentById = getOutlookParentIds(folders);
+  if (!parentById.has(folderId)) return "That folder no longer exists.";
+  const folder = getOutlookFolderSubtree(folders, folderId)[0];
+  if (folder.systemType || !isOutlookFilingTarget(folders, folderId))
+    return "That folder can't be moved.";
+  for (let id = destinationId; id; id = parentById.get(id) ?? undefined) {
+    if (id === folderId)
+      return "A folder can't be moved into itself or one of its subfolders.";
+  }
+  if (destinationId && !isOutlookFilingTarget(folders, destinationId))
+    return "Folders can't be moved there.";
+  if ((parentById.get(folderId) ?? undefined) === destinationId)
+    return "The folder is already there.";
+  return null;
+}
+
+/** The tree without the folder and its subfolders. */
+export function withoutOutlookFolder(
+  folders: OutlookFolder[],
+  folderId: string,
+): OutlookFolder[] {
+  return folders
+    .filter((folder) => folder.id !== folderId)
+    .map((folder) => ({
+      ...folder,
+      childFolders: withoutOutlookFolder(folder.childFolders ?? [], folderId),
+    }));
 }
 
 export function flattenOutlookFolders(
@@ -379,9 +494,7 @@ async function getOrCreateOutlookFolderId(
     return folder.id;
   } catch (error) {
     // The folder can appear between the lookup and the create, or the lookup itself can fail.
-    // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
-    const err = error as any;
-    if (err?.code === "ErrorFolderExists" || err?.statusCode === 409) {
+    if (isFolderExistsError(error)) {
       logger.info("Folder already exists, fetching existing folder", {
         folderName,
       });
@@ -467,4 +580,16 @@ function splitOutlookFolderPath(folderName: string): string[] {
     );
   }
   return segments;
+}
+
+function getOutlookParentIds(
+  folders: OutlookFolder[],
+  parentId: string | null = null,
+  parentById = new Map<string, string | null>(),
+) {
+  for (const folder of folders) {
+    parentById.set(folder.id, parentId);
+    getOutlookParentIds(folder.childFolders ?? [], folder.id, parentById);
+  }
+  return parentById;
 }

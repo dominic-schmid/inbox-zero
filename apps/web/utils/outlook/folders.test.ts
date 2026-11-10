@@ -4,11 +4,14 @@ import {
   getOrCreateOutlookFolderIdByName,
   getOutlookFolderTree,
   isOutlookFolderAvailable,
+  getOutlookFolderMoveProblem,
   getOutlookRootFolders,
   getOutlookChildFolders,
   addOutlookSystemFolderTypes,
   deleteOutlookFolder,
+  moveOutlookFolder,
   renameOutlookFolder,
+  type OutlookFolder,
 } from "./folders";
 import type { OutlookClient } from "./client";
 import { createTestLogger } from "@/__tests__/helpers";
@@ -33,6 +36,19 @@ describe("Outlook folder mutations", () => {
 
     expect(api).toHaveBeenCalledWith("/me/mailFolders/folder%2Fid");
     expect(patch).toHaveBeenCalledWith({ displayName: "Projects" });
+  });
+
+  it("moves a folder to the top level when no destination is given", async () => {
+    const post = vi.fn().mockResolvedValue(undefined);
+    const api = vi.fn().mockReturnValue({ post });
+    const client = {
+      getClient: () => ({ api }),
+    } as unknown as OutlookClient;
+
+    await moveOutlookFolder(client, { folderId: "folder/id" }, logger);
+
+    expect(api).toHaveBeenCalledWith("/me/mailFolders/folder%2Fid/move");
+    expect(post).toHaveBeenCalledWith({ destinationId: "msgfolderroot" });
   });
 
   it("deletes the selected folder", async () => {
@@ -284,6 +300,67 @@ describe("isOutlookFolderAvailable", () => {
       await isOutlookFolderAvailable(loopingClient, "loop-id", logger),
     ).toBe(true);
     expect(requests.length).toBeLessThan(40);
+  });
+});
+
+describe("getOutlookFolderMoveProblem", () => {
+  const tree = [
+    treeFolder("bills", [treeFolder("phone", [treeFolder("2026")])]),
+    treeFolder("work"),
+    treeFolder("inbox", [treeFolder("projects")], "INBOX"),
+    treeFolder("trash", [treeFolder("old")], "TRASH"),
+  ];
+
+  it.each([
+    ["under another branch", "phone", "work"],
+    ["to the top level", "phone", undefined],
+    ["out of a system folder that can hold mail", "projects", undefined],
+    ["into a system folder that can hold mail", "work", "inbox"],
+  ])("allows moving a folder %s", (_case, id, destinationId) => {
+    expect(getOutlookFolderMoveProblem(tree, id, destinationId)).toBeNull();
+  });
+
+  it.each([
+    ["a missing folder", "gone", "work", "That folder no longer exists."],
+    ["a system folder", "inbox", "work", "That folder can't be moved."],
+    [
+      "a folder out of Deleted Items",
+      "old",
+      undefined,
+      "That folder can't be moved.",
+    ],
+    [
+      "a folder into itself",
+      "bills",
+      "bills",
+      "A folder can't be moved into itself or one of its subfolders.",
+    ],
+    [
+      "a folder into its subfolder",
+      "bills",
+      "2026",
+      "A folder can't be moved into itself or one of its subfolders.",
+    ],
+    [
+      "a folder into Deleted Items",
+      "work",
+      "trash",
+      "Folders can't be moved there.",
+    ],
+    [
+      "a folder to where it is",
+      "phone",
+      "bills",
+      "The folder is already there.",
+    ],
+    [
+      "a top-level folder to the top level",
+      "work",
+      undefined,
+      "The folder is already there.",
+    ],
+  ])("refuses moving %s", (_case, id, destinationId, problem) => {
+    expect(getOutlookFolderMoveProblem(tree, id, destinationId)).toBe(problem);
   });
 });
 
@@ -836,19 +913,21 @@ describe("getOutlookRootFolders", () => {
 
 describe("addOutlookSystemFolderTypes", () => {
   it("marks well-known folders by id without relying on localized names", () => {
-    const [inbox, custom] = addOutlookSystemFolderTypes(
+    const [inbox, outbox, custom] = addOutlookSystemFolderTypes(
       [
         {
           id: "inbox-id",
           displayName: "Boîte de réception",
           childFolders: [],
         },
+        { id: "outbox-id", displayName: "Boîte d'envoi", childFolders: [] },
         { id: "custom-id", displayName: "Projects", childFolders: [] },
       ],
-      { inbox: "inbox-id" },
+      { inbox: "inbox-id", outbox: "outbox-id" },
     );
 
     expect(inbox?.systemType).toBe("INBOX");
+    expect(outbox?.systemType).toBe("OUTBOX");
     expect(custom?.systemType).toBeUndefined();
   });
 });
@@ -885,3 +964,19 @@ describe("getOutlookChildFolders", () => {
     expect(result[1].displayName).toBe("Child2");
   });
 });
+
+function treeFolder(
+  id: string,
+  childFolders: OutlookFolder[] = [],
+  systemType?: OutlookFolder["systemType"],
+): OutlookFolder {
+  return {
+    id,
+    displayName: id,
+    childFolders,
+    childFolderCount: childFolders.length,
+    totalItemCount: 0,
+    unreadItemCount: 0,
+    systemType,
+  };
+}

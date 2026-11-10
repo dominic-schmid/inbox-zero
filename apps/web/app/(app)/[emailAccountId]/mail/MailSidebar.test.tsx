@@ -4,6 +4,7 @@ import React from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { TagIcon } from "lucide-react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { OutlookFolder } from "@/utils/outlook/folders";
 import { MailSidebar, type MailSidebarProps } from "./MailSidebar";
 
 (globalThis as { React?: typeof React }).React = React;
@@ -21,11 +22,27 @@ vi.mock("next/link", () => ({
   ),
 }));
 
+vi.mock("@/utils/actions/mail", () => ({ createFolderAction: vi.fn() }));
+
+const { mockRules } = vi.hoisted(() => ({
+  mockRules: {
+    current: [] as
+      | { actions: { type: string; folderId: string | null }[] }[]
+      | undefined,
+  },
+}));
+vi.mock("@/hooks/useRules", () => ({
+  useRules: () => ({ data: mockRules.current }),
+}));
+
 vi.mock("@/components/ui/sidebar", () => ({
   SidebarTrigger: () => null,
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  mockRules.current = [];
+});
 
 function sidebar(overrides: Partial<MailSidebarProps> = {}) {
   return (
@@ -50,6 +67,8 @@ function sidebar(overrides: Partial<MailSidebarProps> = {}) {
       onCreateLabel={vi.fn()}
       onEditMailboxItem={vi.fn()}
       onDeleteMailboxItem={vi.fn()}
+      onMoveFolder={vi.fn()}
+      onFoldersChanged={vi.fn()}
       labelEditMode="name-and-color"
       labelColorOptions={[]}
       {...overrides}
@@ -200,4 +219,100 @@ describe("MailSidebar", () => {
     expect(screen.queryByRole("button", { name: "More" })).toBeNull();
     expect(screen.getByText("All inboxes")).toBeDefined();
   });
+
+  it("nests a folder by dropping it onto another and refuses its own subfolder", () => {
+    const onMoveFolder = vi.fn();
+    renderSidebar({
+      onMoveFolder,
+      folders: [
+        outlookFolder("bills", [outlookFolder("phone")]),
+        outlookFolder("work"),
+      ],
+    });
+    const row = (name: string) =>
+      screen.getByText(name).closest("[draggable]") as HTMLElement;
+    const dataTransfer = { effectAllowed: "", dropEffect: "" };
+
+    fireEvent.dragStart(row("bills"), { dataTransfer });
+    fireEvent.dragOver(row("phone"), { dataTransfer });
+    fireEvent.drop(row("phone"), { dataTransfer });
+    expect(onMoveFolder).not.toHaveBeenCalled();
+
+    fireEvent.dragStart(row("phone"), { dataTransfer });
+    fireEvent.dragOver(row("work"), { dataTransfer });
+    fireEvent.drop(row("work"), { dataTransfer });
+    expect(onMoveFolder).toHaveBeenCalledWith("phone", "work");
+  });
+
+  it("moves a subfolder to the top level when dropped on the Folders heading", () => {
+    const onMoveFolder = vi.fn();
+    renderSidebar({
+      onMoveFolder,
+      folders: [outlookFolder("bills", [outlookFolder("phone")])],
+    });
+    const row = (name: string) =>
+      screen.getByText(name).closest("[draggable]") as HTMLElement;
+    const heading = () =>
+      screen.getByText("Drop here for top level").parentElement as HTMLElement;
+    const dataTransfer = { effectAllowed: "", dropEffect: "" };
+
+    fireEvent.dragStart(row("bills"), { dataTransfer });
+    fireEvent.dragOver(heading(), { dataTransfer });
+    fireEvent.drop(heading(), { dataTransfer });
+    expect(onMoveFolder).not.toHaveBeenCalled();
+
+    fireEvent.dragStart(row("phone"), { dataTransfer });
+    fireEvent.dragOver(heading(), { dataTransfer });
+    fireEvent.drop(heading(), { dataTransfer });
+    expect(onMoveFolder).toHaveBeenCalledWith("phone", undefined);
+  });
+
+  it("asks before moving a folder that rules file into", () => {
+    const onMoveFolder = vi.fn();
+    mockRules.current = [
+      { actions: [{ type: "MOVE_FOLDER", folderId: "phone" }] },
+    ];
+    renderSidebar({
+      onMoveFolder,
+      folders: [
+        outlookFolder("bills", [outlookFolder("phone")]),
+        outlookFolder("work"),
+      ],
+    });
+    const row = (name: string) =>
+      screen.getByText(name).closest("[draggable]") as HTMLElement;
+    const dataTransfer = { effectAllowed: "", dropEffect: "" };
+
+    fireEvent.dragStart(row("bills"), { dataTransfer });
+    fireEvent.dragOver(row("work"), { dataTransfer });
+    fireEvent.drop(row("work"), { dataTransfer });
+
+    expect(onMoveFolder).not.toHaveBeenCalled();
+    expect(screen.getByText(/1 rule files mail into this folder/)).toBeTruthy();
+  });
+
+  it("asks before moving a folder while the rules are still loading", () => {
+    const onMoveFolder = vi.fn();
+    mockRules.current = undefined;
+    renderSidebar({
+      onMoveFolder,
+      folders: [outlookFolder("bills"), outlookFolder("work")],
+    });
+    const row = (name: string) =>
+      screen.getByText(name).closest("[draggable]") as HTMLElement;
+    const dataTransfer = { effectAllowed: "", dropEffect: "" };
+
+    fireEvent.dragStart(row("bills"), { dataTransfer });
+    fireEvent.dragOver(row("work"), { dataTransfer });
+    fireEvent.drop(row("work"), { dataTransfer });
+
+    expect(onMoveFolder).not.toHaveBeenCalled();
+    expect(
+      screen.getByText("Checking which rules file into this folder…"),
+    ).toBeTruthy();
+  });
 });
+
+function outlookFolder(id: string, childFolders: OutlookFolder[] = []) {
+  return { id, displayName: id, childFolders };
+}
